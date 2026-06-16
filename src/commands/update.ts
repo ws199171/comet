@@ -1,18 +1,24 @@
 import path from 'path';
 import os from 'os';
-import { createRequire } from 'module';
 import { promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
+import { select } from '@inquirer/prompts';
 import { fileExists, readDir, readJson } from '../utils/file-system.js';
 import { getBaseDir } from '../core/detect.js';
-import { copyCometSkillsForPlatform, getManifestSkills } from '../core/skills.js';
+import {
+  copyCometSkillsForPlatform,
+  copyCometRulesForPlatform,
+  installCometHooksForPlatform,
+  getManifestSkills,
+} from '../core/skills.js';
 import { PLATFORMS, getPlatformSkillsDir, type Platform } from '../core/platforms.js';
+import { installCodegraph } from '../core/codegraph.js';
 import type { InstallScope } from '../core/types.js';
+import { printVersionInfo } from '../core/version.js';
 
-const require = createRequire(import.meta.url);
-const { version } = require('../../package.json');
 const PACKAGE_NAME = '@rpamis/comet';
+const OFFICIAL_REGISTRY = 'https://registry.npmjs.org';
 
 interface UpdateOptions {
   json?: boolean;
@@ -46,37 +52,50 @@ function getScopedBaseDir(
   return scope === 'global' ? globalBaseDir : projectPath;
 }
 
+function getInstalledCometSkillsDirs(
+  baseDir: string,
+  platform: Platform,
+  scope: InstallScope = 'project',
+): string[] {
+  const dirs = [path.join(baseDir, getPlatformSkillsDir(platform, scope), 'skills')];
+  if (scope === 'global' && platform.id === 'pi') {
+    dirs.push(path.join(baseDir, platform.skillsDir, 'skills'));
+  }
+  return [...new Set(dirs)];
+}
+
 async function hasLocalCometSkills(
   baseDir: string,
   platform: Platform,
   scope: InstallScope,
 ): Promise<boolean> {
-  const skillsDir = path.join(baseDir, getPlatformSkillsDir(platform, scope), 'skills');
-  if (!(await fileExists(skillsDir))) return false;
-
-  const entries = await readDir(skillsDir);
-  return entries.some((entry) => entry.startsWith('comet'));
+  for (const skillsDir of getInstalledCometSkillsDirs(baseDir, platform, scope)) {
+    if (!(await fileExists(skillsDir))) continue;
+    const entries = await readDir(skillsDir);
+    if (entries.some((entry) => entry.startsWith('comet'))) return true;
+  }
+  return false;
 }
 
 async function detectInstalledCometLanguage(
   baseDir: string,
   platform: Platform,
-  scope: InstallScope,
+  scope: InstallScope = 'project',
 ): Promise<SkillLanguage> {
-  const skillsDir = path.join(baseDir, getPlatformSkillsDir(platform, scope), 'skills');
-  if (!(await fileExists(skillsDir))) return 'en';
+  for (const skillsDir of getInstalledCometSkillsDirs(baseDir, platform, scope)) {
+    if (!(await fileExists(skillsDir))) continue;
+    const entries = (await readDir(skillsDir)).filter((entry) => entry.startsWith('comet'));
 
-  const entries = (await readDir(skillsDir)).filter((entry) => entry.startsWith('comet'));
+    for (const entry of entries) {
+      const skillPath = path.join(skillsDir, entry, 'SKILL.md');
+      if (!(await fileExists(skillPath))) continue;
 
-  for (const entry of entries) {
-    const skillPath = path.join(skillsDir, entry, 'SKILL.md');
-    if (!(await fileExists(skillPath))) continue;
-
-    try {
-      const content = await fs.readFile(skillPath, 'utf-8');
-      if (/[\u3400-\u9fff]/u.test(content)) return 'zh';
-    } catch {
-      // Fall through to the default English asset set if the file cannot be read.
+      try {
+        const content = await fs.readFile(skillPath, 'utf-8');
+        if (/[\u3400-\u9fff]/u.test(content)) return 'zh';
+      } catch {
+        // Fall through to the default English asset set if the file cannot be read.
+      }
     }
   }
 
@@ -141,8 +160,8 @@ async function detectCometPackageScope(
 
 function buildNpmUpdateArgs(scope: InstallScope): string[] {
   return scope === 'global'
-    ? ['install', '-g', `${PACKAGE_NAME}@latest`]
-    : ['install', `${PACKAGE_NAME}@latest`];
+    ? ['install', '-g', `${PACKAGE_NAME}@latest`, '--registry', OFFICIAL_REGISTRY]
+    : ['install', `${PACKAGE_NAME}@latest`, '--registry', OFFICIAL_REGISTRY];
 }
 
 function formatNpmUpdateCommand(scope: InstallScope): string {
@@ -162,14 +181,37 @@ function getNpmExecutable(): string {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
-async function updateCometNpmPackage(scope: InstallScope, projectPath: string): Promise<boolean> {
+async function updateCometNpmPackage(
+  scope: InstallScope,
+  projectPath: string,
+  log: (message: string) => void,
+  jsonMode = false,
+): Promise<boolean> {
   const args = buildNpmUpdateArgs(scope);
   const cwd = scope === 'global' ? process.cwd() : projectPath;
 
   return new Promise((resolve) => {
-    const child = spawn(getNpmExecutable(), args, { cwd, stdio: 'inherit', shell: true });
-    child.on('error', () => resolve(false));
-    child.on('exit', (code) => resolve(code === 0));
+    // In JSON mode, discard npm's stdout/stderr so it cannot corrupt the JSON
+    // document emitted on stdout. 'ignore' avoids the pipe backpressure a
+    // verbose npm install could otherwise cause.
+    const child = spawn(getNpmExecutable(), args, {
+      cwd,
+      stdio: jsonMode ? 'ignore' : 'inherit',
+      shell: true,
+    });
+    child.on('error', (err) => {
+      log(`  npm package: failed to launch npm — ${err.message}`);
+      resolve(false);
+    });
+    child.on('exit', (code) => {
+      if (code !== 0) {
+        log(
+          `  npm package: update failed (exit code ${code}). Unable to reach the official npm registry at ${OFFICIAL_REGISTRY}.`,
+        );
+        log(`  Check your network connection or firewall settings and try again.`);
+      }
+      resolve(code === 0);
+    });
   });
 }
 
@@ -180,14 +222,23 @@ export async function updateCommand(
   const projectPath = path.resolve(targetPath);
   const log = options.json ? () => undefined : console.log;
 
-  log(`\n  Comet Update v${version}\n`);
+  log(`\n  Comet Update`);
+  if (!options.json) {
+    await printVersionInfo(log);
+  }
+  log('');
 
   const packageScope = options.scope ?? (await detectCometPackageScope(projectPath));
   let npmStatus: 'updated' | 'failed' | 'skipped' = 'skipped';
   if (!options.skipNpm) {
     log(`  Updating npm package (${packageScope} scope)...`);
     log(`    $ ${formatNpmUpdateCommand(packageScope)}`);
-    const npmUpdated = await updateCometNpmPackage(packageScope, projectPath);
+    const npmUpdated = await updateCometNpmPackage(
+      packageScope,
+      projectPath,
+      log,
+      options.json === true,
+    );
     if (npmUpdated) {
       npmStatus = 'updated';
       log(`  npm package: updated to latest ${PACKAGE_NAME}`);
@@ -212,6 +263,9 @@ export async function updateCommand(
               command: options.skipNpm ? null : formatNpmUpdateCommand(packageScope),
             },
             skills: { totalCopied: 0, targets: [] },
+            rules: { totalCopied: 0 },
+            hooks: { totalInstalled: 0 },
+            codegraph: 'skipped',
           },
           null,
           2,
@@ -236,6 +290,8 @@ export async function updateCommand(
   log(`\n  Copying ${(await getManifestSkills()).length} skill files...\n`);
 
   let totalCopied = 0;
+  let totalRulesCopied = 0;
+  let totalHooksInstalled = 0;
   const targetResults = [];
   for (const target of targets) {
     const baseDir = getBaseDir(target.scope, projectPath);
@@ -261,6 +317,63 @@ export async function updateCommand(
     log(
       `  ${target.platform.name} (${target.scope}, ${languageSkillsDir}): ${copied} copied, ${skipped} skipped`,
     );
+
+    // Distribute anti-drift rules to platforms that support them
+    try {
+      const { copied: ruleCopied } = await copyCometRulesForPlatform(
+        baseDir,
+        target.platform,
+        true,
+        target.scope,
+      );
+      totalRulesCopied += ruleCopied;
+      if (ruleCopied > 0) {
+        log(`  Comet rules -> ${target.platform.name}: ${ruleCopied} rule(s) updated`);
+      }
+    } catch (err) {
+      log(`  Comet rules -> ${target.platform.name}: failed (${(err as Error).message})`);
+    }
+
+    // Install hooks for platforms that support them
+    if (target.platform.supportsHooks) {
+      try {
+        const { installed, reason } = await installCometHooksForPlatform(
+          baseDir,
+          target.platform,
+          target.scope,
+        );
+        if (installed) {
+          totalHooksInstalled++;
+          log(`  Comet hooks -> ${target.platform.name}: phase guard hook updated`);
+        } else if (reason) {
+          log(`  Comet hooks -> ${target.platform.name}: skipped (${reason})`);
+        }
+      } catch (err) {
+        log(`  Comet hooks -> ${target.platform.name}: failed (${(err as Error).message})`);
+      }
+    }
+  }
+
+  // CodeGraph optional step
+  let codegraphStatus: 'installed' | 'failed' | 'skipped' = 'skipped';
+  const primaryScope = targets[0]?.scope ?? 'project';
+
+  if (!options.json) {
+    const shouldInstallCodegraph = await select({
+      message: 'Install/update CodeGraph for semantic code intelligence?',
+      choices: [
+        { name: 'Yes (recommended — saves ~16% cost · cuts ~58% tool calls)', value: true },
+        { name: 'No', value: false },
+      ],
+    });
+
+    if (shouldInstallCodegraph) {
+      log('\n  Installing CodeGraph...');
+      codegraphStatus = await installCodegraph(projectPath, primaryScope);
+      log(`  CodeGraph: ${codegraphStatus}`);
+    } else {
+      log('\n  CodeGraph: skipped');
+    }
   }
 
   if (options.json) {
@@ -276,6 +389,9 @@ export async function updateCommand(
             totalCopied,
             targets: targetResults,
           },
+          rules: { totalCopied: totalRulesCopied },
+          hooks: { totalInstalled: totalHooksInstalled },
+          codegraph: codegraphStatus,
         },
         null,
         2,
@@ -289,6 +405,7 @@ export async function updateCommand(
   log(`\n  Summary:`);
   log(`    npm: ${npmStatus}${options.skipNpm ? '' : ` (${packageScope})`}`);
   log(`    skills: ${targets.length} target(s), ${totalCopied} files updated`);
+  log(`    codegraph: ${codegraphStatus}`);
   log(`    scope: ${scopes}`);
   log(`    language: ${languages}`);
   log(`\n  Update complete.\n`);

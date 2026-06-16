@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import type { Platform } from '../../src/core/platforms.js';
+import { PLATFORMS, type Platform } from '../../src/core/platforms.js';
 import {
   buildNpmUpdateArgs,
   detectCometPackageScope,
@@ -12,6 +12,11 @@ import {
   formatSkillUpdateCommand,
   updateCommand,
 } from '../../src/commands/update.js';
+
+// Mock the interactive select prompt so tests don't hang on CI (no TTY).
+vi.mock('@inquirer/prompts', () => ({
+  select: vi.fn().mockResolvedValue(false),
+}));
 
 const claudePlatform: Platform = {
   id: 'claude',
@@ -119,6 +124,28 @@ describe('update command helpers', () => {
     expect(targets.map((t) => `${t.scope}:${t.platform.id}`)).toEqual(['global:codex']);
   });
 
+  it('detects legacy global Pi skills so update can migrate them', async () => {
+    const projectDir = path.join(tmpDir, 'project');
+    const globalDir = path.join(tmpDir, 'home');
+
+    await fs.mkdir(path.join(globalDir, '.pi', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(globalDir, '.pi', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\nUse this skill.',
+      'utf-8',
+    );
+
+    const targets = await detectInstalledCometTargets(projectDir, {
+      globalBaseDir: globalDir,
+      scopes: ['global'],
+    });
+
+    expect(targets.map((t) => `${t.scope}:${t.platform.id}:${t.language}`)).toEqual([
+      'global:pi:en',
+    ]);
+    expect(PLATFORMS.find((platform) => platform.id === 'pi')?.globalSkillsDir).toBe('.pi/agent');
+  });
+
   it('detects project package scope from local node_modules install path', async () => {
     const projectDir = path.join(tmpDir, 'project');
     const packageRoot = path.join(projectDir, 'node_modules', '@rpamis', 'comet');
@@ -145,14 +172,29 @@ describe('update command helpers', () => {
     await expect(detectCometPackageScope(projectDir, tmpDir)).resolves.toBe('global');
   });
 
-  it('builds npm update args preserving package install scope', () => {
-    expect(buildNpmUpdateArgs('global')).toEqual(['install', '-g', '@rpamis/comet@latest']);
-    expect(buildNpmUpdateArgs('project')).toEqual(['install', '@rpamis/comet@latest']);
+  it('builds npm update args preserving package install scope with official registry', () => {
+    expect(buildNpmUpdateArgs('global')).toEqual([
+      'install',
+      '-g',
+      '@rpamis/comet@latest',
+      '--registry',
+      'https://registry.npmjs.org',
+    ]);
+    expect(buildNpmUpdateArgs('project')).toEqual([
+      'install',
+      '@rpamis/comet@latest',
+      '--registry',
+      'https://registry.npmjs.org',
+    ]);
   });
 
   it('formats the npm update command for friendly console output', () => {
-    expect(formatNpmUpdateCommand('global')).toBe('npm install -g @rpamis/comet@latest');
-    expect(formatNpmUpdateCommand('project')).toBe('npm install @rpamis/comet@latest');
+    expect(formatNpmUpdateCommand('global')).toBe(
+      'npm install -g @rpamis/comet@latest --registry https://registry.npmjs.org',
+    );
+    expect(formatNpmUpdateCommand('project')).toBe(
+      'npm install @rpamis/comet@latest --registry https://registry.npmjs.org',
+    );
   });
 
   it('formats the skill update command with scope, platform, and language source', () => {

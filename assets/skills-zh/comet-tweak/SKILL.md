@@ -13,7 +13,7 @@ Tweak 是 Comet 五阶段能力的预设工作流，不是独立的平行流程�
 1. 不新增 capability
 2. 不改变架构
 3. 不涉及接口变化
-4. 通常不超过 3 个 tasks、4 个文件
+4. 通常不超过 3 个 tasks（文件数约束见下方升级条件）
 
 **不适用**：如变更过程中发现需要 capability、架构或接口调整，应升级为完整 `/comet` 流程。
 
@@ -21,7 +21,11 @@ Tweak 是 Comet 五阶段能力的预设工作流，不是独立的平行流程�
 
 ## 流程（preset workflow，4 阶段）
 
-执行链路：open → lightweight build → light verify → archive。Tweak 为每个阶段提供默认决策：精简开启、轻量构建、轻量验证、验证通过后归档。
+### 0. 输出语言约束
+
+精简版 OpenSpec 产物必须使用触发本次工作流的用户请求语言。
+
+执行链路：open → lightweight build → light verify → archive。Tweak 为每个阶段提供默认决策：精简开启、轻量构建、轻量验证、验证通过后进入归档前最终确认。
 
 开始前先定位 Comet 脚本：
 
@@ -40,19 +44,11 @@ fi
 
 **立即执行：** 使用 Skill 工具加载 `openspec-new-change` 技能。禁止跳过此步骤。
 
-技能加载时，ARGUMENTS 必须包含：
-
-```
-Language: 使用触发本次工作流的用户请求语言输出。
-```
-
 技能加载后，按其指引创建精简版产物：
   - `proposal.md` — 变更动机 + 目标 + 范围
   - `design.md` — 简短实现说明（无需方案对比）
   - `tasks.md` — 不超过 3 个任务
 - **无需 delta spec**（除非变更改变了已有 spec 的验收场景；一旦需要 delta spec，升级为完整 `/comet`）
-
-精简版 OpenSpec 产物必须使用触发本次工作流的用户请求语言。若正在恢复已有 change 且已有产物具备明确主语言，沿用该语言，除非用户明确要求切换。
 
 初始化 Comet 状态文件：
 
@@ -90,6 +86,10 @@ Language: 使用触发本次工作流的用户请求语言输出。
 3. 全部任务完成后，显式运行项目相关测试和构建命令
 4. 运行阶段守卫完成 build → verify 过渡：
 
+执行 tweak 期间，只要运行程序、测试、构建或手动验证时出现崩溃、异常行为、测试失败或构建失败，必须使用 Skill 工具加载 Superpowers `systematic-debugging` 技能。在完成根因调查前，不得提出或实施源码修复。
+
+具体调查、最小失败测试、修复验证和保持当前 change 验证闭环的要求，按 `comet/reference/debug-gate.md` 执行。
+
 ```bash
 "$COMET_BASH" "$COMET_GUARD" <change-name> build --apply
 ```
@@ -104,11 +104,11 @@ Language: 使用触发本次工作流的用户请求语言输出。
 
 如规模评估进入完整验证路径，停止 tweak，按升级条件阻塞确认处理。
 
-验证通过后，按 `/comet-verify` 的规则将 `.comet.yaml` 的 `verify_result` 记录为 `pass`，归档前不得跳过该状态。
+验证通过后，按 `/comet-verify` 的规则将 `.comet.yaml` 的 `verify_result` 记录为 `pass`，归档前不得跳过该状态。验证通过后仍必须进入 `/comet-archive` 的归档前最终确认，不得自动运行归档脚本。
 
 ### 4. 归档（preset archive）
 
-复用 `/comet-archive`。归档前必须满足 `.comet.yaml` 中 `verify_result: pass`。
+复用 `/comet-archive`。归档前必须满足 `.comet.yaml` 中 `verify_result: pass`，并等待 `/comet-archive` 的归档前最终确认。
 
 **立即执行：** 使用 Skill 工具加载 `comet-archive` 技能进行归档。禁止跳过此步骤。
 
@@ -117,10 +117,11 @@ Language: 使用触发本次工作流的用户请求语言输出。
 ## 连续执行模式
 
 <IMPORTANT>
-Tweak 流程为 **一次性连续执行**。调用 `/comet-tweak` 后，agent 在 tweak 自有步骤间自动推进，不主动停顿。但以下情况必须暂停等待用户确认：
+Tweak 流程默认 **一次性连续执行**。调用 `/comet-tweak` 后，agent 在 tweak 自有步骤间自动推进，不主动停顿。**例外**：若 `auto_transition: false`，则在每个 phase 边界（build/verify/archive 之间）停下，由用户手动运行下一阶段命令——此时连续执行降级为逐阶段手动推进，详见下方「自动衔接下一阶段」。但无论 `auto_transition` 取何值，以下情况都必须暂停等待用户确认：
 
-1. 遇到升级条件（见"升级条件"章节），**必须使用 AskUserQuestion 工具暂停并等待用户明确确认**升级为完整流程
+1. 遇到升级条件（见"升级条件"章节），**必须使用当前平台可用的用户输入/确认机制暂停并等待用户明确确认**升级为完整流程
 2. 验证阶段（comet-verify）的验证失败决策和分支处理决策
+3. 归档前最终确认（comet-archive 执行归档脚本前）
 
 执行顺序：快速开启 → 轻量构建 → 轻量验证 → 归档 → 完成
 
@@ -142,12 +143,13 @@ Tweak 流程为 **一次性连续执行**。调用 `/comet-tweak` 后，agent �
 | 需要新增 capability | 超出局部优化 |
 | 需要 delta spec | 影响了已有规格 |
 
-满足升级条件时**必须使用 AskUserQuestion 工具暂停并等待用户明确确认**升级为完整 `/comet` 流程。不得直接进入 `/comet-design`，不得自动补充 Design Doc。不得仅输出文字提示后继续执行。
+满足升级条件时**必须按 `comet/reference/decision-point.md` 的协议暂停并等待用户明确确认**升级为完整 `/comet` 流程。不得直接进入 `/comet-design`，不得自动补充 Design Doc。
 
-用户确认升级后，**必须先更新 workflow 字段**再进入完整流程：
+用户确认升级后，**必须先更新 workflow 和 phase 字段**再进入完整流程：
 
 ```bash
 "$COMET_BASH" "$COMET_STATE" set <name> workflow full
+"$COMET_BASH" "$COMET_STATE" set <name> phase design
 ```
 
 然后在当前 change 基础上补充 Design Doc：**立即使用 Skill 工具加载 `comet-design` skill**，后续正常走完整流程。若用户不确认升级，停止 tweak 并报告当前变更已超出 tweak 适用范围。
@@ -160,3 +162,15 @@ Tweak 流程为 **一次性连续执行**。调用 `/comet-tweak` 后，agent �
 - change 已归档
 - 未新增 capability、架构调整或接口变化
 - **阶段守卫**：build → verify 前运行 `"$COMET_BASH" "$COMET_GUARD" <change-name> build --apply`，verify → archive 前按 `/comet-verify` 规则运行 `"$COMET_BASH" "$COMET_GUARD" <change-name> verify --apply`
+
+## 自动衔接下一阶段
+
+按 `comet/reference/auto-transition.md` 执行。关键命令：
+
+```bash
+"$COMET_BASH" "$COMET_STATE" next <name>
+```
+
+- `NEXT: auto` → 调用 `SKILL` 指向的 skill 继续 tweak 流程（`phase: build` 返回 `comet-tweak`，`verify` 返回 `comet-verify`，`archive` 返回 `comet-archive`）
+- `NEXT: manual` → 不要调用下一 skill，按 `HINT` 提示用户手动运行 `/<SKILL>`
+- `NEXT: done` → 流程已完成，无需继续

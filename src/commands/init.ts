@@ -5,11 +5,15 @@ import { PLATFORMS, getPlatformSkillsDir, type Platform } from '../core/platform
 import { detectPlatforms, hasSkills, getBaseDir, type InstallScope } from '../core/detect.js';
 import {
   copyCometSkillsForPlatform,
+  copyCometRulesForPlatform,
+  installCometHooksForPlatform,
   createWorkingDirs,
   type LanguageConfig,
 } from '../core/skills.js';
 import { installOpenSpec } from '../core/openspec.js';
 import { installSuperpowersForPlatforms } from '../core/superpowers.js';
+import { installCodegraph } from '../core/codegraph.js';
+import { printVersionInfo } from '../core/version.js';
 
 type InitOptions = {
   yes?: boolean;
@@ -28,6 +32,7 @@ interface PlatformResult {
   openspec: InstallStatus;
   superpowers: InstallStatus;
   comet: InstallStatus;
+  codegraph: InstallStatus;
 }
 
 type ComponentPlan = {
@@ -150,13 +155,25 @@ function displaySummary(results: PlatformResult[], scope: InstallScope): void {
   console.log(`\n  Comet setup complete! (scope: ${scopeLabel})\n`);
 
   const installed = results.filter(
-    (r) => r.openspec === 'installed' || r.superpowers === 'installed' || r.comet === 'installed',
+    (r) =>
+      r.openspec === 'installed' ||
+      r.superpowers === 'installed' ||
+      r.comet === 'installed' ||
+      r.codegraph === 'installed',
   );
   const skipped = results.filter(
-    (r) => r.openspec === 'skipped' && r.superpowers === 'skipped' && r.comet === 'skipped',
+    (r) =>
+      r.openspec === 'skipped' &&
+      r.superpowers === 'skipped' &&
+      r.comet === 'skipped' &&
+      r.codegraph === 'skipped',
   );
   const failed = results.filter(
-    (r) => r.openspec === 'failed' || r.superpowers === 'failed' || r.comet === 'failed',
+    (r) =>
+      r.openspec === 'failed' ||
+      r.superpowers === 'failed' ||
+      r.comet === 'failed' ||
+      r.codegraph === 'failed',
   );
 
   if (installed.length > 0) {
@@ -187,6 +204,9 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
   const log = options.json ? () => undefined : console.log;
 
   log(`\n${COMET_BANNER}\n`);
+  if (!options.json) {
+    await printVersionInfo(log);
+  }
   log(`  Setting up Comet in ${projectPath}\n`);
 
   const detected = await detectPlatforms(projectPath);
@@ -315,12 +335,59 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
       log(`  Comet -> ${platform.name}: skipped (already exists)`);
     }
 
+    // Distribute anti-drift rules to platforms that support them
+    if (cmAction !== 'skip') {
+      const { copied: ruleCopied } = await copyCometRulesForPlatform(
+        baseDir,
+        platform,
+        cmAction === 'overwrite',
+        scope,
+      );
+      if (ruleCopied > 0) {
+        log(`  Comet rules -> ${platform.name}: ${ruleCopied} rule(s) installed`);
+      }
+    }
+
+    // Install hooks for platforms that support them
+    if (cmAction !== 'skip' && platform.supportsHooks) {
+      const { installed, reason } = await installCometHooksForPlatform(baseDir, platform, scope);
+      if (installed) {
+        log(`  Comet hooks -> ${platform.name}: phase guard hook installed`);
+      } else if (reason) {
+        log(`  Comet hooks -> ${platform.name}: skipped (${reason})`);
+      }
+    }
+
     results.push({
       platform,
       openspec: osToolIds.includes(platform.openspecToolId) ? osGlobalStatus : 'skipped',
       superpowers: plan.spAction !== 'skip' ? spGlobalStatus : 'skipped',
       comet: cmStatus,
+      codegraph: 'skipped',
     });
+  }
+
+  let cgGlobalStatus: InstallStatus;
+  const shouldInstallCodegraph =
+    !options.json &&
+    (options.yes ||
+      (await select({
+        message: 'Install CodeGraph for semantic code intelligence?',
+        choices: [
+          { name: 'Yes (recommended — saves ~16% cost · cuts ~58% tool calls)', value: true },
+          { name: 'No', value: false },
+        ],
+      })));
+
+  if (shouldInstallCodegraph) {
+    log('\n  Installing CodeGraph...');
+    cgGlobalStatus = await installCodegraph(projectPath, scope);
+    log(`  CodeGraph: ${cgGlobalStatus}`);
+    for (const r of results) {
+      r.codegraph = cgGlobalStatus;
+    }
+  } else {
+    log('\n  CodeGraph: skipped');
   }
 
   if (scope === 'project') {
@@ -341,6 +408,7 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
             openspec: result.openspec,
             superpowers: result.superpowers,
             comet: result.comet,
+            codegraph: result.codegraph,
           })),
           workingDirsCreated: scope === 'project',
         },
