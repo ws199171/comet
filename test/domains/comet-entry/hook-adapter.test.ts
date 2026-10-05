@@ -1,0 +1,397 @@
+import { describe, expect, it } from 'vitest';
+import path from 'path';
+import { pathToFileURL } from 'node:url';
+
+import {
+  COMET_HOOK_PLATFORM_IDS,
+  parseCometHookRequest,
+  renderCometHookDecision,
+} from '../../../domains/comet-entry/hook-adapter.js';
+import { parseCometHookRequest as parsePlatformHookRequest } from '../../../platform/process/hook-adapter.js';
+import { PLATFORMS } from '../../../platform/install/platforms.js';
+
+const PLATFORM_FIXTURES = [
+  {
+    id: 'claude',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/claude.ts' } },
+  },
+  {
+    id: 'codex',
+    single: { tool_name: 'Edit', tool_input: { file_path: 'src/codex.ts' } },
+  },
+  {
+    id: 'windsurf',
+    single: { file_path: 'src/windsurf.ts' },
+  },
+  {
+    id: 'github-copilot',
+    single: { toolName: 'create', toolArgs: '{"file_path":"src/github-copilot.ts"}' },
+  },
+  {
+    id: 'gemini',
+    single: { tool_name: 'write_file', tool_input: { file_path: 'src/gemini.ts' } },
+  },
+  {
+    id: 'amazon-q',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/amazon-q.ts' } },
+  },
+  {
+    id: 'qwen',
+    single: { tool_name: 'WriteFile', tool_input: { file_path: 'src/qwen.ts' } },
+  },
+  {
+    id: 'kiro',
+    single: {
+      tool_name: 'write',
+      tool_input: { operations: [{ mode: 'Line', path: 'src/kiro.ts' }] },
+    },
+  },
+  {
+    id: 'codebuddy',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/codebuddy.ts' } },
+  },
+  {
+    id: 'workbuddy',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/workbuddy.ts' } },
+  },
+  {
+    id: 'oh-my-pi',
+    single: { tool_name: 'write', tool_input: { path: 'src/oh-my-pi.ts' } },
+  },
+  {
+    id: 'qoder',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/qoder.ts' } },
+  },
+  {
+    id: 'trae',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/trae.ts' } },
+  },
+  {
+    id: 'trae-cn',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/trae-cn.ts' } },
+  },
+  {
+    id: 'grok',
+    single: { toolName: 'write', toolInput: { file_path: 'src/grok.ts' } },
+  },
+  {
+    id: 'dsh',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/dsh.ts' } },
+  },
+  {
+    id: 'zcode',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/zcode.ts' } },
+  },
+] as const;
+
+describe('Comet Hook platform adapter', () => {
+  it('ignores non-file resource targets without discarding real files in the same event', () => {
+    const file = path.resolve('src/new-file.ts');
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'write',
+          tool_input: {
+            paths: [
+              'agent:/Main',
+              'proc:/worker/kill',
+              'xd:/report_issue',
+              'https://example.test/action',
+              pathToFileURL(file).href,
+              'src/other.ts',
+            ],
+          },
+        }),
+      ),
+    ).toMatchObject({ intent: 'write', targets: [file, 'src/other.ts'] });
+    expect(
+      parseCometHookRequest(JSON.stringify({ tool_input: { targets: ['agent:/Main'] } })),
+    ).toMatchObject({ targets: [] });
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({ tool_name: 'write', tool_input: { path: 'C:\\project\\new.ts' } }),
+      ),
+    ).toMatchObject({ intent: 'write', targets: ['C:\\project\\new.ts'] });
+  });
+  it('exposes the protocol adapter from the platform layer without changing parsing', () => {
+    const source = JSON.stringify({ tool_name: 'Write', file_path: 'src/example.ts' });
+    expect(parsePlatformHookRequest(source)).toEqual(parseCometHookRequest(source));
+  });
+  it('keeps the fixture matrix aligned with every declared Hook platform', () => {
+    expect(PLATFORM_FIXTURES.map(({ id }) => id)).toEqual([...COMET_HOOK_PLATFORM_IDS]);
+  });
+
+  it('routes every platform that installs hooks through the adapter', () => {
+    const hookCapablePlatformIds = PLATFORMS.filter(
+      (platform) => platform.hookFormat !== undefined,
+    ).map((platform) => platform.id);
+    expect(hookCapablePlatformIds.length).toBeGreaterThan(0);
+    for (const id of hookCapablePlatformIds) {
+      expect(COMET_HOOK_PLATFORM_IDS.has(id)).toBe(true);
+    }
+  });
+
+  it('parses a payload carrying a leading UTF-8 BOM', () => {
+    const source =
+      String.fromCharCode(0xfeff) +
+      JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 'src/a.ts' } });
+    expect(parseCometHookRequest(source)).toEqual({
+      intent: 'write',
+      targets: ['src/a.ts'],
+      toolName: 'Write',
+    });
+  });
+
+  it.each(PLATFORM_FIXTURES)('normalizes the $id native single-file payload', ({ id, single }) => {
+    expect(parseCometHookRequest(JSON.stringify(single))).toMatchObject({
+      intent: 'write',
+      targets: [`src/${id}.ts`],
+    });
+  });
+
+  it('normalizes Claude and Copilot payloads', () => {
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 'src/a.ts' } }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/a.ts'], toolName: 'Write' });
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          toolName: 'apply_patch',
+          toolArgs: { patch: '*** Update File: src/b.ts' },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/b.ts'], toolName: 'apply_patch' });
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          toolName: 'search_replace',
+          toolInput: { file_path: 'src/c.ts' },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/c.ts'], toolName: 'search_replace' });
+  });
+
+  it('normalizes raw Codex apply_patch input from Hook stdin', () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Update File: src/existing.ts',
+      '*** Add File: src/new.ts',
+      '*** Delete File: src/old.ts',
+      '*** End Patch',
+    ].join('\n');
+
+    expect(parseCometHookRequest(patch)).toEqual({
+      intent: 'write',
+      targets: ['src/existing.ts', 'src/new.ts', 'src/old.ts'],
+      toolName: 'apply_patch',
+    });
+  });
+
+  it('normalizes standard unified-diff headers from raw patch input', () => {
+    const patch = ['--- a/src/old.ts', '+++ b/src/new.ts'].join('\n');
+
+    expect(parseCometHookRequest(patch)).toEqual({
+      intent: 'write',
+      targets: ['src/new.ts'],
+      toolName: 'apply_patch',
+    });
+  });
+
+  it('keeps an absolute Hook working directory for linked-worktree routing', () => {
+    const cwd = path.resolve('linked-worktree');
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'Write',
+          cwd,
+          tool_input: { file_path: 'src/a.ts' },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/a.ts'], toolName: 'Write', cwd });
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'Write',
+          cwd: 'relative/worktree',
+          tool_input: { file_path: 'src/a.ts' },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/a.ts'], toolName: 'Write' });
+  });
+
+  it('recognizes an agent-start task as a context request', () => {
+    const cwd = path.resolve('omp-project');
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          hook_event_name: 'before_agent_start',
+          task: 'Implement the dashboard',
+          cwd,
+          session_id: 'session-file',
+        }),
+      ),
+    ).toEqual({
+      intent: 'context',
+      targets: [],
+      toolName: null,
+      task: 'Implement the dashboard',
+      cwd,
+      sessionId: 'session-file',
+    });
+  });
+
+  it('collects every target atomically and fails unknown writes closed', () => {
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: { file_paths: ['src/a.ts', 'src/b.ts'] },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/a.ts', 'src/b.ts'], toolName: 'Edit' });
+    expect(parseCometHookRequest('{broken')).toEqual({
+      intent: 'unknown',
+      targets: [],
+      toolName: null,
+    });
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'FutureWriteTool',
+          tool_input: { file_path: 'src/future.ts' },
+        }),
+      ),
+    ).toEqual({
+      intent: 'unknown',
+      targets: ['src/future.ts'],
+      toolName: 'FutureWriteTool',
+    });
+  });
+
+  it('collects nested Kiro operation targets atomically', () => {
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'write',
+          tool_input: {
+            operations: [
+              { mode: 'Line', path: 'src/a.ts' },
+              { mode: 'Line', path: 'src/b.ts' },
+            ],
+          },
+        }),
+      ),
+    ).toEqual({
+      intent: 'write',
+      targets: ['src/a.ts', 'src/b.ts'],
+      toolName: 'write',
+    });
+  });
+
+  it.each(PLATFORM_FIXTURES)(
+    'handles $id multi-file, patch, non-write, and malformed input',
+    () => {
+      expect(
+        parseCometHookRequest(
+          JSON.stringify({
+            tool_name: 'Edit',
+            tool_input: { file_paths: ['src/a.ts', 'src/b.ts'] },
+          }),
+        ),
+      ).toMatchObject({ intent: 'write', targets: ['src/a.ts', 'src/b.ts'] });
+      expect(
+        parseCometHookRequest(
+          JSON.stringify({
+            tool_name: 'apply_patch',
+            tool_input: {
+              patch: '*** Update File: src/a.ts\n*** Add File: src/b.ts',
+            },
+          }),
+        ),
+      ).toMatchObject({ intent: 'write', targets: ['src/a.ts', 'src/b.ts'] });
+      expect(
+        parseCometHookRequest(
+          JSON.stringify({ tool_name: 'Read', tool_input: { path: 'src/a.ts' } }),
+        ),
+      ).toEqual({ intent: 'non-write', targets: [], toolName: 'Read' });
+      expect(parseCometHookRequest('{broken')).toEqual({
+        intent: 'unknown',
+        targets: [],
+        toolName: null,
+      });
+    },
+  );
+
+  it('retains real file targets when a mixed request has a malformed file URI', () => {
+    expect(
+      parseCometHookRequest(
+        JSON.stringify({
+          tool_name: 'Write',
+          tool_input: { file_paths: ['src/real.ts', 'file://%broken'] },
+        }),
+      ),
+    ).toMatchObject({ intent: 'write', targets: ['src/real.ts', 'file://%broken'] });
+  });
+
+  it('renders Copilot structured denial without granting permission on allow', () => {
+    expect(
+      renderCometHookDecision('github-copilot', { allowed: false, reason: 'blocked' }),
+    ).toEqual({
+      exitCode: 0,
+      stdout: '{"permissionDecision":"deny","permissionDecisionReason":"blocked"}\n',
+      stderr: '',
+    });
+    expect(renderCometHookDecision('github-copilot', { allowed: true, reason: 'allowed' })).toEqual(
+      {
+        exitCode: 0,
+        stdout: '{}\n',
+        stderr: '',
+      },
+    );
+  });
+
+  it('emits an allowed context diagnostic on stderr without changing host protocols', () => {
+    expect(
+      renderCometHookDecision('github-copilot', {
+        allowed: true,
+        reason: 'context unavailable',
+        diagnostic: 'bounded diagnostic',
+      }),
+    ).toEqual({ exitCode: 0, stdout: '{}\n', stderr: 'bounded diagnostic\n' });
+    expect(
+      renderCometHookDecision('claude', {
+        allowed: true,
+        reason: 'context unavailable',
+        diagnostic: 'bounded diagnostic',
+      }),
+    ).toEqual({ exitCode: 0, stdout: '', stderr: 'bounded diagnostic\n' });
+  });
+
+  it.each(PLATFORM_FIXTURES.filter(({ id }) => id !== 'github-copilot'))(
+    'renders $id allow and deny through its exit-code protocol',
+    ({ id }) => {
+      expect(renderCometHookDecision(id, { allowed: true, reason: 'allowed' })).toEqual({
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+      });
+      expect(renderCometHookDecision(id, { allowed: false, reason: 'blocked' })).toEqual({
+        exitCode: 2,
+        stdout: '',
+        stderr: 'blocked\n',
+      });
+    },
+  );
+
+  it('rejects an unknown platform instead of guessing its denial protocol', () => {
+    expect(
+      renderCometHookDecision('unknown-platform', { allowed: false, reason: 'blocked' }),
+    ).toEqual({
+      exitCode: 64,
+      stdout: '',
+      stderr: 'Unsupported Comet Hook platform: unknown-platform\n',
+    });
+  });
+});

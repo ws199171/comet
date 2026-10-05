@@ -1,0 +1,225 @@
+import { describe, expect, it } from 'vitest';
+import { promises as fs } from 'fs';
+import path from 'path';
+
+const CLASSIC_SKILLS = [
+  'comet-classic',
+  'comet-open',
+  'comet-design',
+  'comet-build',
+  'comet-verify',
+  'comet-archive',
+  'comet-hotfix',
+  'comet-tweak',
+];
+
+const LANGUAGE_CASES = [
+  {
+    label: 'Chinese',
+    languageRoot: 'skills-zh',
+    ruleFiles: ['comet-phase-guard.md', 'comet-workflow-guard.md'],
+    allowedLayoutDescriptionLines: new Set([
+      '- 新 Classic 项目默认使用 `docs/openspec/`。',
+      '- 为兼容旧项目，缺少 `classic.artifact_layout` 时使用项目根下的 `openspec/`（legacy）；新项目 init 会明确写入 docs。`comet update` 检测到已有 `openspec/` 产物时，会把配置补为 `legacy`，不会移动产物。',
+    ]),
+  },
+  {
+    label: 'English',
+    languageRoot: 'skills',
+    ruleFiles: ['comet-phase-guard.en.md', 'comet-workflow-guard.en.md'],
+    allowedLayoutDescriptionLines: new Set([
+      '- New Classic projects default to `docs/openspec/`.',
+      '- For backward compatibility, a project without `classic.artifact_layout` uses root-level `openspec/` (legacy). New-project init explicitly writes docs. If `comet update` finds existing `openspec/` artifacts, it records `legacy` without moving them.',
+    ]),
+  },
+] as const;
+
+const BARE_OPENSPEC_COMMAND =
+  /(?<!comet classic )\bopenspec\s+(?:--version|<args\.\.\.>|[a-z][a-z0-9-]*)/u;
+const FIXED_OPENSPEC_PATH = /openspec\//u;
+const EXTERNAL_OPENSPEC_SKILL_INVOCATION = /(?:加载|load)[^`\r\n]*`openspec-[a-z0-9-]+`/iu;
+const EXTERNAL_OPENSPEC_OVERRIDE = /external-openspec-skill-override/u;
+
+async function markdownFiles(root: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      const resolved = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        return markdownFiles(resolved);
+      }
+      return entry.isFile() && entry.name.endsWith('.md') ? [resolved] : [];
+    }),
+  );
+  return files.flat();
+}
+
+async function classicGuidanceFiles(
+  languageRoot: string,
+  ruleFiles: readonly string[],
+): Promise<string[]> {
+  const assetRoot = path.resolve('assets', languageRoot);
+  const files = CLASSIC_SKILLS.map((skill) => path.join(assetRoot, skill, 'SKILL.md'));
+  files.push(...(await markdownFiles(path.join(assetRoot, 'comet-classic', 'reference'))));
+  files.push(...(await markdownFiles(path.join(assetRoot, 'comet-any'))));
+  files.push(...ruleFiles.map((rule) => path.resolve('assets', 'skills', 'comet', 'rules', rule)));
+  return files;
+}
+
+describe('Classic layout Skill contract', () => {
+  it.each([
+    {
+      file: 'comet-workflow-guard.md',
+      diagnostic: '诊断动作',
+      recovery: '恢复命令',
+    },
+    {
+      file: 'comet-workflow-guard.en.md',
+      diagnostic: 'diagnostic action',
+      recovery: 'recovery command',
+    },
+  ])('keeps Hook recovery guidance executable in $file', async ({ file, diagnostic, recovery }) => {
+    const source = await fs.readFile(path.resolve('assets/skills/comet/rules', file), 'utf8');
+
+    expect(source).toContain(diagnostic);
+    expect(source).toContain(recovery);
+    expect(source).toContain('continuation.commandArgs');
+    expect(source).toContain('comet native archive <change> --confirmed');
+  });
+
+  it.each(LANGUAGE_CASES)(
+    'keeps $label entry layout bindings and commands aligned',
+    async ({ languageRoot }) => {
+      const reference = await fs.readFile(
+        path.resolve('assets', languageRoot, 'comet-classic/reference/classic-layout.md'),
+        'utf8',
+      );
+      const entry = reference.indexOf('comet state check <change-name> <phase> --json');
+      expect(entry).toBeGreaterThanOrEqual(0);
+      expect(reference.indexOf('comet classic root show')).toBeGreaterThan(entry);
+      for (const field of [
+        'comet.classic-layout.v1',
+        'openSpecRoot',
+        'changesRoot',
+        'archiveRoot',
+        'specsRoot',
+        'superpowersRoot',
+        'changeDir',
+      ]) {
+        expect(reference, field).toContain(field);
+      }
+      for (const phase of ['design', 'build', 'verify', 'archive']) {
+        const source = await fs.readFile(
+          path.resolve('assets', languageRoot, `comet-${phase}/SKILL.md`),
+          'utf8',
+        );
+        expect(source, phase).toContain('comet-classic/reference/classic-layout.md');
+        expect(source, phase).toMatch(
+          new RegExp(`comet state check <(?:change-name|name)> ${phase} --json`, 'u'),
+        );
+      }
+    },
+  );
+
+  it('uses the Chinese entry layout without duplicate root probes and resolves archived change paths', async () => {
+    const reference = await fs.readFile(
+      path.resolve('assets/skills-zh/comet-classic/reference/classic-layout.md'),
+      'utf8',
+    );
+    expect(reference).toContain('state check <change-name> <phase> --json');
+    expect(reference).toContain('无需再单独查询布局');
+    expect(reference).toContain('尚未选择 change、入口未提供 layout');
+    expect(reference).toContain('使用入口返回的 changeDir');
+    expect(reference).toContain('对于已归档的 change，不要使用未归档 change 的目录规则拼接路径');
+    expect(reference).toContain('恢复会话时若缺少上下文，或工作区发生变化，应重新查询');
+    for (const skill of ['comet-design', 'comet-build', 'comet-verify', 'comet-archive']) {
+      const content = await fs.readFile(
+        path.resolve('assets/skills-zh', skill, 'SKILL.md'),
+        'utf8',
+      );
+      expect(content, skill).toContain('收到入口返回的 layout 后');
+      expect(content, skill).toContain('无需先额外运行 root show');
+      expect(content, skill).toMatch(
+        /comet state check <(?:change-name|name)> (?:design|build|verify|archive) --json/u,
+      );
+    }
+  });
+
+  it.each(['skills-zh', 'skills'])(
+    'ships the layout resolver and adapter protocol in %s',
+    async (languageRoot) => {
+      const reference = await fs.readFile(
+        path.resolve('assets', languageRoot, 'comet-classic', 'reference', 'classic-layout.md'),
+        'utf8',
+      );
+      expect(reference).toContain('comet classic root show');
+      expect(reference).toContain('comet classic openspec -- <args...>');
+      expect(reference).toContain('openSpecRoot');
+      expect(reference).toContain('superpowersRoot');
+      expect(reference).toContain('comet classic root move docs --dry-run');
+
+      for (const skill of CLASSIC_SKILLS) {
+        const source = await fs.readFile(
+          path.resolve('assets', languageRoot, skill, 'SKILL.md'),
+          'utf8',
+        );
+        expect(source, skill).toContain('comet-classic/reference/classic-layout.md');
+      }
+    },
+  );
+
+  describe.each(LANGUAGE_CASES)(
+    '$label Comet-owned guidance',
+    ({ languageRoot, ruleFiles, allowedLayoutDescriptionLines }) => {
+      it('uses the adapter and resolver-backed logical roots everywhere', async () => {
+        const files = await classicGuidanceFiles(languageRoot, ruleFiles);
+        const violations: string[] = [];
+
+        for (const file of files) {
+          const source = await fs.readFile(file, 'utf8');
+          const isLayoutReference =
+            path.basename(file) === 'classic-layout.md' &&
+            path.basename(path.dirname(file)) === 'reference';
+
+          source.split(/\r?\n/u).forEach((line, index) => {
+            const lineNumber = index + 1;
+            if (BARE_OPENSPEC_COMMAND.test(line)) {
+              violations.push(`${path.relative(process.cwd(), file)}:${lineNumber}: bare command`);
+            }
+            if (
+              FIXED_OPENSPEC_PATH.test(line) &&
+              !(
+                isLayoutReference &&
+                (allowedLayoutDescriptionLines as ReadonlySet<string>).has(line)
+              )
+            ) {
+              violations.push(`${path.relative(process.cwd(), file)}:${lineNumber}: fixed path`);
+            }
+          });
+        }
+
+        expect(violations).toEqual([]);
+      });
+
+      it('overrides every external OpenSpec Skill command and cwd instruction locally', async () => {
+        const files = await classicGuidanceFiles(languageRoot, ruleFiles);
+        const violations: string[] = [];
+
+        for (const file of files) {
+          const lines = (await fs.readFile(file, 'utf8')).split(/\r?\n/u);
+          lines.forEach((line, index) => {
+            if (!EXTERNAL_OPENSPEC_SKILL_INVOCATION.test(line)) return;
+            const localInstructions = lines.slice(index + 1, index + 6).join('\n');
+            if (!EXTERNAL_OPENSPEC_OVERRIDE.test(localInstructions)) {
+              violations.push(
+                `${path.relative(process.cwd(), file)}:${index + 1}: missing local external Skill override`,
+              );
+            }
+          });
+        }
+
+        expect(violations).toEqual([]);
+      });
+    },
+  );
+});

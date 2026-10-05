@@ -1,0 +1,732 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+
+import { inspectGitWorktree, type GitWorktreeContext } from '../../platform/paths/git-worktree.js';
+
+import { inspectNativeChildren } from './native-children.js';
+import { readNativeSupervisorState, type NativeSupervisorState } from './native-supervisor.js';
+import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
+import { nativePortableContinuation } from './native-portable-continuation.js';
+import { nativePortableCheckPlansFromLocal } from './native-portable-checks.js';
+import {
+  nativeVerifierExecutionRefForState,
+  nativeVerifierStartupConfirmationForState,
+} from './native-local-execution.js';
+import { nativePortableChangeDir, readNativePortableRuntime } from './native-portable-runtime.js';
+import { nativePortableStateSummary } from './native-portable-summary.js';
+import type { NativeLocalExecutionState, NativePortableState } from './native-portable-types.js';
+import { nativeChangeArtifactPaths } from './native-paths.js';
+import type { NativeProjectPaths, NativeChangeArtifactPaths } from './native-types.js';
+import type { NativeWorkspaceFinishJournal } from './native-workspace-finish.js';
+
+export interface NativePortableAcceptanceCounts {
+  total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  pending: number;
+}
+
+export interface NativePortableStatusProjection {
+  schema: 'comet.native.status.v2';
+  name: string;
+  artifacts: NativeChangeArtifactPaths;
+  phase: NativePortableState['phase'];
+  status: NativePortableState['status'];
+  stateVersion: number;
+  archived?: boolean;
+  archiveRef?: string;
+  coordinationMode?: NativePortableState['coordination_mode'];
+  loop: NativePortableState['loop'];
+  acceptance: NativePortableAcceptanceCounts;
+  unresolvedAcceptanceIds: string[];
+  verificationResult: NativePortableState['verification_result'];
+  blockers: ReturnType<typeof nativePortableStateSummary>['blockers'];
+  workspace: {
+    projectRoot: string;
+    isolation: NativePortableState['workspace']['isolation'];
+    bindingState: 'aligned' | 'mismatch';
+    changeBranch: string | null;
+    targetBranch: string | null;
+    finish: NativePortableState['workspace']['finish'];
+    message: string | null;
+  };
+  localExecution: {
+    status: 'available' | 'missing' | 'invalid' | 'stale' | 'not-expected';
+    operation: NativeLocalExecutionState['execution'];
+    /**
+     * Present while a dispatched Verifier attempt is awaited. Distinguishes a
+     * registered dispatch from a Verifier that actually contacted Runtime.
+     */
+    verifierStartup?: {
+      attempt: number;
+      registeredAt: string;
+      confirmedAt: string | null;
+      confirmation: 'unconfirmed' | 'confirmed';
+      /** Whole minutes since registration while never confirmed (unconfirmed only). */
+      waitingMinutes?: number;
+    };
+  };
+  childSummary?: Record<string, number>;
+  readyChildren?: string[];
+  supervisorOverlay?: {
+    status: 'repairable-legacy-overlay' | 'incompatible';
+    message: string;
+    repairCommand: string | null;
+  };
+  supervisor?: NativeSupervisorStatusProjection;
+  continuation: ReturnType<typeof nativePortableContinuation>;
+  details?: {
+    stateVersion: number;
+    supervisorStateVersion?: number;
+    items: NativePortableStatusDetailItem[];
+    nextCursor: string | null;
+    nextPageArgs: string[] | null;
+  };
+}
+
+export interface NativePortableStatusDetailItem {
+  kind:
+    | 'acceptance'
+    | 'spec-change'
+    | 'builder-handoff'
+    | 'verification'
+    | 'history'
+    | 'history-overflow'
+    | 'workspace'
+    | 'verification-report'
+    | 'supervisor-integration'
+    | 'supervisor-final-verification'
+    | 'supervisor-child'
+    | 'supervisor-history';
+  value: unknown;
+}
+
+export interface NativeSupervisorStatusProjection {
+  schema: NativeSupervisorState['schema'];
+  parent: string;
+  integration: Pick<NativeSupervisorState['integration'], 'branch' | 'targetBranch'>;
+  finalVerification: Pick<NativeSupervisorState['finalVerification'], 'status' | 'summary'>;
+  summary: {
+    targetSpecs: number;
+    implementationChildren: number;
+    waiting: number;
+    working: number;
+    integrated: number;
+    blocked: number;
+    active: Array<{
+      name: string;
+      summary: string | null;
+      projectRoot: string | null;
+      reason: string | null;
+    }>;
+    agents: { working: number; completed: number };
+    risks: string[];
+    nextAction: string | null;
+  };
+}
+
+function detailsCursor(
+  stateVersion: number,
+  supervisorStateVersion: number,
+  offset: number,
+): string {
+  return `native-details-v2.${stateVersion}.${supervisorStateVersion}.${offset.toString(36)}`;
+}
+
+function detailsOffset(
+  cursor: string | undefined,
+  stateVersion: number,
+  supervisorStateVersion: number,
+): number {
+  if (!cursor) return 0;
+  const match = /^native-details-v2\.(\d+)\.(\d+)\.([0-9a-z]+)$/u.exec(cursor);
+  if (!match || Number(match[1]) !== stateVersion || Number(match[2]) !== supervisorStateVersion) {
+    throw new Error('Native details cursor is stale or invalid');
+  }
+  const offset = Number.parseInt(match[3], 36);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error('Native details cursor offset is invalid');
+  }
+  return offset;
+}
+
+function detailItems(
+  state: NativePortableState,
+  supervisor: NativeSupervisorState | null,
+  supervisorRoots: readonly string[],
+): NativePortableStatusDetailItem[] {
+  return [
+    ...state.acceptance.map((value) => ({ kind: 'acceptance' as const, value })),
+    ...state.spec_changes.map((value) => ({ kind: 'spec-change' as const, value })),
+    ...(state.builder_handoff
+      ? [{ kind: 'builder-handoff' as const, value: state.builder_handoff }]
+      : []),
+    ...(state.verification ? [{ kind: 'verification' as const, value: state.verification }] : []),
+    ...state.history.map((value) => ({ kind: 'history' as const, value })),
+    { kind: 'history-overflow' as const, value: state.history_overflow },
+    { kind: 'workspace' as const, value: state.workspace },
+    ...(state.verification_report
+      ? [{ kind: 'verification-report' as const, value: state.verification_report }]
+      : []),
+    ...(supervisor
+      ? [
+          {
+            kind: 'supervisor-integration' as const,
+            value: {
+              ...supervisor.integration,
+              worktree: '<worktree>',
+              targetCommit: '<redacted>',
+              headCommit: '<redacted>',
+            },
+          },
+          {
+            kind: 'supervisor-final-verification' as const,
+            value: supervisor.finalVerification,
+          },
+          ...supervisor.children.map((value) => ({
+            kind: 'supervisor-child' as const,
+            value: redactSupervisorChild(value, supervisorRoots),
+          })),
+          ...supervisor.history.map((value) => ({
+            kind: 'supervisor-history' as const,
+            value: redactSupervisorHistory(value, supervisorRoots),
+          })),
+        ]
+      : []),
+  ];
+}
+
+function counts(state: NativePortableState): NativePortableAcceptanceCounts {
+  return state.acceptance.reduce<NativePortableAcceptanceCounts>(
+    (result, entry) => ({ ...result, [entry.result]: result[entry.result] + 1 }),
+    { total: state.acceptance.length, passed: 0, failed: 0, blocked: 0, pending: 0 },
+  );
+}
+
+function verifierStartupProjection(
+  state: NativePortableState,
+  local: NativeLocalExecutionState | null | undefined,
+): NativePortableStatusProjection['localExecution']['verifierStartup'] {
+  const execution = local?.execution;
+  if (
+    state.phase !== 'verify' ||
+    state.status !== 'active' ||
+    state.loop.next_action !== 'await-verifier-result' ||
+    !execution ||
+    execution.stage !== 'verifying' ||
+    execution.actor !== 'verifier' ||
+    execution.status !== 'running'
+  ) {
+    return undefined;
+  }
+  const confirmedAt = execution.verifierStartedAt ?? null;
+  const confirmation = nativeVerifierStartupConfirmationForState(state, local ?? null);
+  if (confirmation === undefined) return undefined;
+  const confirmed = confirmation === 'confirmed';
+  return {
+    attempt: state.loop.attempt,
+    registeredAt: execution.startedAt,
+    confirmedAt,
+    confirmation: confirmed ? 'confirmed' : 'unconfirmed',
+    ...(confirmed
+      ? {}
+      : {
+          waitingMinutes: Math.max(
+            0,
+            Math.round((Date.now() - Date.parse(execution.startedAt)) / 60_000),
+          ),
+        }),
+  };
+}
+
+export function projectNativePortableWorkspace(
+  paths: NativeProjectPaths,
+  state: NativePortableState,
+  context: GitWorktreeContext = inspectGitWorktree(paths.projectRoot),
+) {
+  let message: string | null = null;
+  if (state.workspace.change_branch !== null) {
+    if (!context.isGitWorktree) {
+      message = 'The Native change requires a registered Git worktree.';
+    } else if (context.currentBranch !== state.workspace.change_branch) {
+      message = `Expected branch ${state.workspace.change_branch}, current branch is ${context.currentBranch ?? '(detached)'}.`;
+    }
+  }
+  if (
+    message === null &&
+    state.workspace.isolation === 'worktree' &&
+    !context.isSecondaryWorktree
+  ) {
+    message = 'The Native change requires its linked worktree.';
+  }
+  return {
+    projectRoot: path.resolve(paths.projectRoot),
+    isolation: state.workspace.isolation,
+    bindingState: message === null ? ('aligned' as const) : ('mismatch' as const),
+    changeBranch: state.workspace.change_branch,
+    targetBranch: state.workspace.target_branch,
+    finish: state.workspace.finish,
+    message,
+  };
+}
+
+export function projectNativeArchivedStatus(options: {
+  paths: NativeProjectPaths;
+  state: NativePortableState;
+  file: string;
+  details?: boolean;
+  cursor?: string;
+  finishJournal?: NativeWorkspaceFinishJournal | null;
+}): NativePortableStatusProjection {
+  const { state, paths } = options;
+  const finishJournal = options.finishJournal ?? null;
+  const summary = nativePortableStateSummary(state);
+  const finishBlocked = finishJournal !== null;
+  const finishMessage =
+    finishJournal?.result?.message ??
+    'Native Archive completed, but workspace finish is still pending; retry the recorded finish command.';
+  const continuation = finishBlocked
+    ? {
+        ...nativePortableContinuation(state),
+        status: 'blocked' as const,
+        disposition: 'blocked' as const,
+        action: 'archive' as const,
+        requiresUserDecision: false,
+        commandArgs: finishJournal?.result?.recoveryArgs ?? [
+          'comet',
+          'native',
+          'archive',
+          state.name,
+          '--confirmed',
+        ],
+        requiredInputs: [],
+        inputOptions: [],
+        userCommunication: {
+          required: true,
+          message: finishMessage,
+          suggestedReply: null,
+          agentInstruction:
+            'Report the Git blocker and resolve it within the recorded delivery authorization, then retry the recorded Native workspace finish command. Ask the user only when new information or authorization is required; keep delivery pending until it succeeds.',
+        },
+        runnerAction: {
+          ...nativePortableContinuation(state).runnerAction,
+          kind: 'none' as const,
+        },
+      }
+    : nativePortableContinuation(state);
+  const all = options.details ? detailItems(state, null, []) : [];
+  const offset = detailsOffset(options.cursor, state.state_version, 0);
+  const items = all.slice(offset, offset + 32);
+  const nextCursor =
+    offset + items.length < all.length
+      ? detailsCursor(state.state_version, 0, offset + items.length)
+      : null;
+  return {
+    schema: 'comet.native.status.v2',
+    name: state.name,
+    artifacts: nativeChangeArtifactPaths(paths, state.name),
+    phase: state.phase,
+    status: finishBlocked ? 'blocked' : state.status,
+    stateVersion: state.state_version,
+    archived: true,
+    archiveRef: path.relative(paths.projectRoot, options.file).replaceAll('\\', '/'),
+    loop: state.loop,
+    acceptance: counts(state),
+    unresolvedAcceptanceIds: summary.unresolved_acceptance_ids,
+    verificationResult: state.verification_result,
+    blockers: finishBlocked
+      ? [
+          ...summary.blockers,
+          {
+            owner: 'runtime' as const,
+            reason: finishMessage,
+            acceptance_ids: [],
+            resolution_action: 'wait-external' as const,
+          },
+        ]
+      : summary.blockers,
+    workspace: {
+      projectRoot: paths.projectRoot,
+      isolation: state.workspace.isolation,
+      bindingState: 'aligned',
+      changeBranch: state.workspace.change_branch,
+      targetBranch: state.workspace.target_branch,
+      finish: state.workspace.finish,
+      message: null,
+    },
+    localExecution: { status: 'not-expected', operation: null },
+    continuation,
+    ...(options.details
+      ? {
+          details: {
+            stateVersion: state.state_version,
+            items,
+            nextCursor,
+            nextPageArgs: nextCursor
+              ? [
+                  'comet',
+                  'native',
+                  'status',
+                  state.name,
+                  '--details',
+                  '--cursor',
+                  nextCursor,
+                  '--project-root',
+                  paths.projectRoot,
+                  '--json',
+                ]
+              : null,
+          },
+        }
+      : {}),
+  };
+}
+
+function supervisorPublicRoots(paths: NativeProjectPaths, state: NativeSupervisorState): string[] {
+  return [
+    paths.projectRoot,
+    state.integration.worktree,
+    ...state.children.flatMap((child) => [child.projectRoot, child.task?.projectRoot]),
+  ]
+    .filter((root): root is string => Boolean(root))
+    .map((root) => root.replaceAll('/', '\\'))
+    .sort((left, right) => right.length - left.length);
+}
+
+function redactSupervisorText(value: string | null, roots: readonly string[]): string | null {
+  if (value === null) return null;
+  return roots.reduce(
+    (result, root) =>
+      result.replaceAll(root, '<worktree>').replaceAll(root.replaceAll('\\', '/'), '<worktree>'),
+    value,
+  );
+}
+
+function redactSupervisorChild(
+  child: NativeSupervisorState['children'][number],
+  roots: readonly string[],
+) {
+  return {
+    ...child,
+    projectRoot: child.projectRoot ? '<worktree>' : null,
+    baseCommit: child.baseCommit ? '<redacted>' : null,
+    candidateCommit: child.candidateCommit ? '<redacted>' : null,
+    verifiedCommit: child.verifiedCommit ? '<redacted>' : null,
+    integrationCommit: child.integrationCommit ? '<redacted>' : null,
+    blocker: redactSupervisorText(child.blocker, roots),
+    task: child.task
+      ? {
+          ...child.task,
+          projectRoot: '<worktree>',
+          baseCommit: '<redacted>',
+          runId: '<redacted>',
+        }
+      : null,
+  };
+}
+
+function redactSupervisorHistory(
+  event: NativeSupervisorState['history'][number],
+  roots: readonly string[],
+) {
+  return {
+    ...event,
+    runId: event.runId ? '<redacted>' : null,
+    summary: redactSupervisorText(event.summary, roots) ?? '',
+  };
+}
+
+export async function inspectNativePortableStatus(options: {
+  paths: NativeProjectPaths;
+  name: string;
+  details?: boolean;
+  cursor?: string;
+  gitContext?: GitWorktreeContext;
+}): Promise<NativePortableStatusProjection> {
+  const runtime = await readNativePortableRuntime(options);
+  const stateSummary = nativePortableStateSummary(runtime.state);
+  const localExpected = runtime.state.status === 'active' && runtime.state.loop.stage !== 'done';
+  const children = await inspectNativeChildren({ paths: options.paths, state: runtime.state });
+  const supervisorOverlay = await inspectNativeSupervisorOverlay({
+    paths: options.paths,
+    state: runtime.state,
+  });
+  const supervisor =
+    supervisorOverlay.status === 'repairable-legacy-overlay' ||
+    supervisorOverlay.status === 'incompatible'
+      ? null
+      : await readNativeSupervisorState(options.paths, options.name, { diagnostics: true });
+  const workspace = supervisor
+    ? {
+        ...projectNativePortableWorkspace(options.paths, runtime.state, options.gitContext),
+        projectRoot: '.',
+      }
+    : projectNativePortableWorkspace(options.paths, runtime.state, options.gitContext);
+  const continuation = nativePortableContinuation(runtime.state, children, {
+    verifierExecutionRef: nativeVerifierExecutionRefForState(runtime.state, runtime.local),
+    verifierStartup: nativeVerifierStartupConfirmationForState(
+      runtime.state,
+      runtime.localStatus === 'available' ? runtime.local : null,
+    ),
+    ...(runtime.local
+      ? {
+          verificationCheckPlans: nativePortableCheckPlansFromLocal(
+            runtime.local,
+            runtime.local.workspace.projectRoot,
+          ),
+        }
+      : {}),
+  });
+  const effectiveContinuation =
+    workspace.bindingState === 'mismatch'
+      ? {
+          ...continuation,
+          disposition: 'await-user' as const,
+          action: 'none' as const,
+          commandArgs: null,
+          requiredInputs: ['return-to-bound-workspace'],
+          runnerAction: {
+            ...continuation.runnerAction,
+            kind: 'none' as const,
+          },
+        }
+      : continuation;
+  const supervisorRoots = supervisor ? supervisorPublicRoots(options.paths, supervisor) : [];
+  const supervisorSummary = supervisor
+    ? (() => {
+        const projectedStatuses = new Map(
+          children?.children.map((child) => [child.name, child.status]) ?? [],
+        );
+        const effectiveStatus = (child: NativeSupervisorState['children'][number]) =>
+          projectedStatuses.get(child.name) ?? child.status;
+        const waiting = supervisor.children.filter(
+          (child) => effectiveStatus(child) === 'pending' || effectiveStatus(child) === 'ready',
+        ).length;
+        const working = supervisor.children.filter(
+          (child) => effectiveStatus(child) === 'active' || effectiveStatus(child) === 'verified',
+        ).length;
+        const integrated = supervisor.children.filter(
+          (child) =>
+            effectiveStatus(child) === 'integrated' || effectiveStatus(child) === 'archived',
+        ).length;
+        const blocked = supervisor.children.filter(
+          (child) =>
+            effectiveStatus(child) === 'blocked' || effectiveStatus(child) === 'needs-reverify',
+        ).length;
+        const active = supervisor.children
+          .filter(
+            (child) =>
+              effectiveStatus(child) === 'active' ||
+              effectiveStatus(child) === 'blocked' ||
+              effectiveStatus(child) === 'needs-reverify',
+          )
+          .slice(0, 16)
+          .map((child) => ({
+            name: child.name,
+            summary: child.summary,
+            projectRoot: (child.task?.projectRoot ?? child.projectRoot) ? '<worktree>' : null,
+            reason: redactSupervisorText(child.blocker, supervisorRoots),
+          }));
+        const risks = supervisor.children
+          .flatMap(({ blocker }) => {
+            const redacted = redactSupervisorText(blocker, supervisorRoots);
+            return redacted ? [redacted] : [];
+          })
+          .slice(0, 16);
+        return {
+          targetSpecs: runtime.state.spec_changes.length,
+          implementationChildren: supervisor.children.length,
+          waiting,
+          working,
+          integrated,
+          blocked,
+          active,
+          agents: {
+            working: supervisor.children.filter(({ task }) => task !== null).length,
+            completed: integrated,
+          },
+          risks,
+          nextAction:
+            supervisor.finalVerification.status === 'passed'
+              ? 'final-delivery'
+              : supervisor.finalVerification.status === 'pending' &&
+                  integrated === supervisor.children.length
+                ? 'parent-verification'
+                : waiting > 0
+                  ? 'dispatch-ready-child'
+                  : blocked > 0
+                    ? 'resolve-blocker'
+                    : 'continue-supervisor',
+        };
+      })()
+    : null;
+  const detailProjection = options.details
+    ? (() => {
+        const supervisorStateVersion = supervisor?.stateVersion ?? 0;
+        const allDetails = detailItems(runtime.state, supervisor, supervisorRoots);
+        const offset = detailsOffset(
+          options.cursor,
+          runtime.state.state_version,
+          supervisorStateVersion,
+        );
+        const items = allDetails.slice(offset, offset + 32);
+        const nextCursor =
+          offset + items.length < allDetails.length
+            ? detailsCursor(
+                runtime.state.state_version,
+                supervisorStateVersion,
+                offset + items.length,
+              )
+            : null;
+        return { items, nextCursor, supervisorStateVersion };
+      })()
+    : null;
+  const supervisorProjection = supervisor
+    ? {
+        schema: supervisor.schema,
+        parent: supervisor.parent,
+        integration: {
+          branch: supervisor.integration.branch,
+          targetBranch: supervisor.integration.targetBranch,
+        },
+        finalVerification: {
+          status: supervisor.finalVerification.status,
+          summary: supervisor.finalVerification.summary,
+        },
+        summary: supervisorSummary!,
+      }
+    : null;
+  return {
+    schema: 'comet.native.status.v2',
+    name: runtime.state.name,
+    artifacts: nativeChangeArtifactPaths(options.paths, runtime.state.name),
+    phase: runtime.state.phase,
+    status: runtime.state.status,
+    stateVersion: runtime.state.state_version,
+    ...(runtime.state.coordination_mode === undefined
+      ? {}
+      : { coordinationMode: runtime.state.coordination_mode }),
+    loop: runtime.state.loop,
+    acceptance: counts(runtime.state),
+    unresolvedAcceptanceIds: stateSummary.unresolved_acceptance_ids,
+    verificationResult: runtime.state.verification_result,
+    blockers: supervisor ? [] : stateSummary.blockers,
+    workspace,
+    localExecution: (() => {
+      const startup = verifierStartupProjection(
+        runtime.state,
+        runtime.localStatus === 'available' ? runtime.local : null,
+      );
+      return {
+        status: localExpected ? runtime.localStatus : 'not-expected',
+        operation: runtime.localStatus === 'available' ? (runtime.local?.execution ?? null) : null,
+        ...(startup ? { verifierStartup: startup } : {}),
+      };
+    })(),
+    ...(children
+      ? {
+          childSummary: children.children.reduce<Record<string, number>>(
+            (summary, child) => ({
+              ...summary,
+              [child.status]: (summary[child.status] ?? 0) + 1,
+            }),
+            { total: children.children.length },
+          ),
+          readyChildren: children.readyChildren,
+        }
+      : {}),
+    ...(supervisorProjection ? { supervisor: supervisorProjection } : {}),
+    ...(supervisorOverlay.status === 'repairable-legacy-overlay' ||
+    supervisorOverlay.status === 'incompatible'
+      ? {
+          supervisorOverlay: {
+            status: supervisorOverlay.status,
+            message: supervisorOverlay.message,
+            repairCommand:
+              supervisorOverlay.status === 'repairable-legacy-overlay'
+                ? `comet native doctor ${options.name} --repair`
+                : null,
+          },
+        }
+      : {}),
+    continuation: effectiveContinuation,
+    ...(options.details
+      ? {
+          details: {
+            stateVersion: runtime.state.state_version,
+            ...(supervisor
+              ? { supervisorStateVersion: detailProjection!.supervisorStateVersion }
+              : {}),
+            items: detailProjection!.items,
+            nextCursor: detailProjection!.nextCursor,
+            nextPageArgs: detailProjection!.nextCursor
+              ? [
+                  'comet',
+                  'native',
+                  'status',
+                  runtime.state.name,
+                  '--details',
+                  '--cursor',
+                  detailProjection!.nextCursor,
+                  '--json',
+                  '--project-root',
+                  options.paths.projectRoot,
+                ]
+              : null,
+          },
+        }
+      : {}),
+  };
+}
+
+export async function listNativePortableChangeNames(paths: NativeProjectPaths): Promise<string[]> {
+  let entries: import('node:fs').Dirent[];
+  try {
+    entries = await fs.readdir(paths.changesDir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    try {
+      const source = await fs.readFile(
+        `${nativePortableChangeDir(paths, entry.name)}/comet-state.yaml`,
+        'utf8',
+      );
+      if (/^schema:\s*comet\.native\.v4\s*$/mu.test(source)) names.push(entry.name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return names.sort((left, right) => left.localeCompare(right, 'en'));
+}
+
+export async function listNativePortableStatus(options: {
+  paths: NativeProjectPaths;
+  offset?: number;
+  limit?: number;
+}): Promise<{
+  schema: 'comet.native.status-page.v2';
+  items: NativePortableStatusProjection[];
+  total: number;
+  nextOffset: number | null;
+}> {
+  const names = await listNativePortableChangeNames(options.paths);
+  const offset = options.offset ?? 0;
+  const limit = options.limit ?? 32;
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error('Native status page bounds are invalid');
+  }
+  const selected = names.slice(offset, offset + limit);
+  return {
+    schema: 'comet.native.status-page.v2',
+    items: await Promise.all(
+      selected.map((name) => inspectNativePortableStatus({ paths: options.paths, name })),
+    ),
+    total: names.length,
+    nextOffset: offset + selected.length < names.length ? offset + selected.length : null,
+  };
+}

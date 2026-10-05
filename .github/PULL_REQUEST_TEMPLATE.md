@@ -20,10 +20,10 @@
 
 - [ ] `pnpm build`
 - [ ] `pnpm lint`
+- [ ] `pnpm run lint:architecture`
 - [ ] `pnpm format:check`
 - [ ] `pnpm test`
-- [ ] `pnpm test -- test/ts/comet-scripts.test.ts`
-- [ ] `pnpm test:shell`
+- [ ] `pnpm test -- test/domains/comet-classic/comet-scripts.test.ts`
 - [ ] Not run:
 
 ## ✅ Checklist

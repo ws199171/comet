@@ -1,0 +1,1020 @@
+import { fixtureAcceptanceReview } from '../../helpers/native-builder-acceptance-review.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { promises as fs } from 'fs';
+import os from 'os';
+import path from 'path';
+
+import {
+  createNativeChange,
+  writeNativeChange,
+} from '../../../domains/comet-native/native-change.js';
+import {
+  inspectNativeHookGuard,
+  resolveActiveNativeHookChange,
+  parseNativeHookRequest,
+  type NativeHookRequest,
+} from '../../../domains/comet-native/native-hook-guard.js';
+import { runNativeCli } from '../../../domains/comet-native/native-cli.js';
+import {
+  defaultProjectConfig,
+  writeProjectConfig,
+} from '../../../domains/comet-native/native-config.js';
+import {
+  ensureNativeDirectories,
+  nativeProjectPaths,
+} from '../../../domains/comet-native/native-paths.js';
+import { selectNativeChange } from '../../../domains/comet-native/native-selection.js';
+import {
+  createNativePortableChange,
+  nativePortableChangeDir,
+  readNativePortableChange,
+  submitNativePortableBuilderCandidate,
+} from '../../../domains/comet-native/native-portable-runtime.js';
+import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
+import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
+import { runWithHookReadCache } from '../../../platform/process/hook-read-cache.js';
+import * as portableRuntime from '../../../domains/comet-native/native-portable-runtime.js';
+
+function passedReview(reviewerExecutionRef: string) {
+  return {
+    status: 'passed' as const,
+    summary: 'Independent read-only review passed.',
+    reviewerExecutionRef,
+  };
+}
+
+describe('Native phase Hook guard', () => {
+  let projectRoot: string;
+
+  const writeRequest = (...targets: string[]): NativeHookRequest => ({
+    intent: targets.length > 0 ? 'write' : 'unknown',
+    targets,
+  });
+
+  const nonWriteRequest = (): NativeHookRequest => ({ intent: 'non-write', targets: [] });
+
+  async function addHookAllowPath(relativePath: string): Promise<void> {
+    await fs.appendFile(
+      path.join(projectRoot, '.comet', 'config.yaml'),
+      `hook:\n  allow_paths:\n    - ${relativePath}\n`,
+    );
+  }
+
+  async function activeChange(
+    phase: 'shape' | 'build' | 'verify' | 'archive',
+    name: string,
+    artifactRoot = '.',
+  ) {
+    const paths = await nativeProjectPaths(projectRoot, artifactRoot);
+    await ensureNativeDirectories(paths);
+    const state = await createNativeChange({
+      paths,
+      name,
+      language: 'en',
+      verificationProtocol: 'legacy-v1',
+    });
+    state.phase = phase;
+    await writeNativeChange(paths, state);
+    return { paths, state };
+  }
+
+  async function portableBuild(name: string, artifactRoot = '.') {
+    const paths = await nativeProjectPaths(projectRoot, artifactRoot);
+    await ensureNativeDirectories(paths);
+    await createNativePortableChange({ paths, name, language: 'en' });
+    await fs.writeFile(
+      path.join(nativePortableChangeDir(paths, name), 'brief.md'),
+      '# Acceptance examples\n- The implementation exposes the requested behavior.\n',
+    );
+    const state = await confirmNativePortableShape({ paths, name });
+    return { paths, state };
+  }
+
+  beforeEach(async () => {
+    projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-hook-'));
+    execFileSync('git', ['init'], { cwd: projectRoot, stdio: 'ignore' });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(projectRoot, { recursive: true, force: true });
+  });
+
+  it('shares the selected state read within a Hook decision and refreshes the next decision', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig());
+    const { paths, state } = await activeChange('shape', 'selected-read', 'docs');
+    const stateFile = path.join(paths.changesDir, state.name, 'comet-state.yaml');
+    const read = vi.spyOn(fs, 'readFile');
+    const open = vi.spyOn(fs, 'open');
+    await runWithHookReadCache(async () => {
+      expect(await resolveActiveNativeHookChange(projectRoot, state.name)).toMatchObject({
+        phase: 'shape',
+      });
+      expect(
+        await inspectNativeHookGuard(projectRoot, writeRequest('docs/readme.md'), state.name),
+      ).toMatchObject({ allowed: true, phase: 'shape' });
+    });
+    // The legacy schema probe and state parse each read once, instead of being repeated by the Guard.
+    expect(
+      read.mock.calls.filter(([file]) => String(file) === stateFile).length +
+        open.mock.calls.filter(([file]) => String(file) === stateFile).length,
+    ).toBe(2);
+    await writeNativeChange(paths, { ...state, phase: 'build' });
+    await runWithHookReadCache(async () => {
+      expect(
+        await inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), state.name),
+      ).toMatchObject({ allowed: true, phase: 'build' });
+    });
+  });
+
+  it('discards the selected Hook snapshot before returning a candidate to Build', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig());
+    const { paths, state } = await portableBuild('hook-invalidates', 'docs');
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: createNativeRunnerChannel().captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'hook-builder',
+        }),
+        candidateId: 'hook-candidate',
+        summary: 'Implemented the requested behavior.',
+        addressedAcceptanceIds: ['A1'],
+        acceptanceReview: fixtureAcceptanceReview(['A1']),
+      },
+    });
+    const returnToBuild = portableRuntime.returnNativePortableChangeToBuild;
+    vi.spyOn(portableRuntime, 'returnNativePortableChangeToBuild').mockImplementationOnce(
+      async (options) => {
+        // A nested observer may populate another snapshot while the mutation is pending.
+        expect(await resolveActiveNativeHookChange(projectRoot, state.name)).toMatchObject({
+          phase: 'verify',
+        });
+        return returnToBuild(options);
+      },
+    );
+    await runWithHookReadCache(async () => {
+      expect(await resolveActiveNativeHookChange(projectRoot, state.name)).toMatchObject({
+        phase: 'verify',
+      });
+      expect(
+        await inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts'), state.name),
+      ).toMatchObject({ allowed: true, phase: 'build' });
+      expect(await resolveActiveNativeHookChange(projectRoot, state.name)).toMatchObject({
+        phase: 'build',
+      });
+    });
+  });
+
+  it('normalizes Claude-compatible and native Hook payloads with every write target', () => {
+    expect(
+      parseNativeHookRequest(
+        JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: { file_path: 'src/index.ts', paths: ['src/a.ts', 'src/b.ts'] },
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/index.ts', 'src/a.ts', 'src/b.ts'] });
+
+    expect(
+      parseNativeHookRequest(
+        JSON.stringify({
+          toolName: 'edit',
+          toolArgs: JSON.stringify({ filePath: 'src/copilot.ts' }),
+        }),
+      ),
+    ).toEqual({ intent: 'write', targets: ['src/copilot.ts'] });
+  });
+
+  it('extracts every target from apply_patch headers', () => {
+    expect(
+      parseNativeHookRequest(
+        JSON.stringify({
+          toolName: 'apply_patch',
+          toolArgs: {
+            patch: [
+              '*** Begin Patch',
+              '*** Update File: src/existing.ts',
+              '*** Add File: src/new.ts',
+              '*** Delete File: src/old.ts',
+              '*** End Patch',
+            ].join('\n'),
+          },
+        }),
+      ),
+    ).toEqual({
+      intent: 'write',
+      targets: ['src/existing.ts', 'src/new.ts', 'src/old.ts'],
+    });
+  });
+
+  it('distinguishes explicit non-write tools from unknown write payloads', () => {
+    expect(parseNativeHookRequest(JSON.stringify({ toolName: 'view', toolArgs: {} }))).toEqual({
+      intent: 'non-write',
+      targets: [],
+    });
+    expect(parseNativeHookRequest(JSON.stringify({ tool_name: 'Write', tool_input: {} }))).toEqual({
+      intent: 'unknown',
+      targets: [],
+    });
+    expect(parseNativeHookRequest('{broken')).toEqual({ intent: 'unknown', targets: [] });
+    expect(parseNativeHookRequest('')).toEqual({ intent: 'unknown', targets: [] });
+  });
+
+  it.each([
+    ['shape', false],
+    ['build', true],
+    ['verify', false],
+    ['archive', false],
+  ] as const)('%s applies the ordinary project write boundary', async (phase, allowed) => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange(phase, `guard-${phase}`);
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed,
+      phase,
+      change: `guard-${phase}`,
+    });
+  });
+
+  it('allows a configured project-local path during Native Shape', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await addHookAllowPath('docs/team-notes');
+    await activeChange('shape', 'shape-allow-path');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('docs/team-notes/note.md')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'shape',
+      reason: expect.stringContaining('configured Hook allow path'),
+    });
+  });
+
+  it('does not let the allowlist bypass Native Runtime-owned files', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await addHookAllowPath('.comet');
+    await activeChange('shape', 'runtime-reserved-allow-path');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('.comet/runtime/extra.json')),
+    ).resolves.toMatchObject({ allowed: false, phase: 'shape' });
+  });
+
+  it.each(['shape', 'verify', 'archive'] as const)(
+    '%s stays neutral when a write target cannot be attributed',
+    async (phase) => {
+      await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+      await activeChange(phase, `unknown-${phase}`);
+
+      await expect(inspectNativeHookGuard(projectRoot, writeRequest())).resolves.toMatchObject({
+        allowed: true,
+        phase,
+        reason: expect.stringContaining('not attributed'),
+      });
+    },
+  );
+
+  it('allows explicit non-write tools during a guarded phase', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange('shape', 'read-during-shape');
+
+    await expect(inspectNativeHookGuard(projectRoot, nonWriteRequest())).resolves.toMatchObject({
+      allowed: true,
+      reason: 'Hook event is not a write',
+    });
+  });
+
+  it('allows portable Build implementation writes while protecting Runtime-owned state', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-build');
+    const briefRef = path
+      .relative(projectRoot, path.join(nativePortableChangeDir(paths, state.name), 'brief.md'))
+      .replaceAll('\\', '/');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(briefRef, 'src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('separate actions'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'build',
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({ allowed: true, phase: 'build', change: state.name });
+    const stateRef = path
+      .relative(
+        projectRoot,
+        path.join(nativePortableChangeDir(paths, state.name), 'comet-state.yaml'),
+      )
+      .replaceAll('\\', '/');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(stateRef)),
+    ).resolves.toMatchObject({ allowed: false, reason: expect.stringContaining('Runtime-owned') });
+  });
+
+  it('keeps parent Build implementation writes assigned to child changes', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const paths = await nativeProjectPaths(projectRoot, '.');
+    await ensureNativeDirectories(paths);
+    const branch = execFileSync('git', ['branch', '--show-current'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+    }).trim();
+    await createNativePortableChange({
+      paths,
+      name: 'portable-parent',
+      language: 'en',
+      workspaceBinding: {
+        isolation: 'current',
+        changeBranch: branch,
+        targetBranch: branch,
+      },
+    });
+    const changeDir = nativePortableChangeDir(paths, 'portable-parent');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      '# Acceptance examples\n- The child implements the requested behavior.\n',
+    );
+    await fs.writeFile(
+      path.join(changeDir, 'children.yaml'),
+      'schema: comet.native.children.v1\nchildren:\n  - name: implementation-child\n    depends_on: []\n    covers: [A1]\n',
+    );
+    await confirmNativePortableShape({ paths, name: 'portable-parent' });
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      phase: 'build',
+      reason: expect.stringContaining('parent Build advances child changes'),
+    });
+    await expect(readNativePortableChange(paths, 'portable-parent')).resolves.toMatchObject({
+      phase: 'build',
+      children_contract_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+  });
+
+  it('invalidates a portable Verify candidate before allowing an implementation write', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-verify-write');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('runtime-owned-state-reviewer'),
+      },
+    });
+
+    const stateRef = path
+      .relative(
+        projectRoot,
+        path.join(nativePortableChangeDir(paths, state.name), 'comet-state.yaml'),
+      )
+      .replaceAll('\\', '/');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts', stateRef)),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Runtime-owned'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'verify',
+    });
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'build',
+      reason: expect.stringContaining('candidate was invalidated'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'build',
+      builder_handoff: {
+        review: { reviewer_execution_ref: 'runtime-owned-state-reviewer' },
+      },
+      verification: null,
+    });
+  });
+
+  it('allows concurrent implementation writes after invalidating one Verify candidate once', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-concurrent-write');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('concurrent-guard-reviewer'),
+      },
+    });
+
+    const results = await Promise.all([
+      inspectNativeHookGuard(projectRoot, writeRequest('src/a.ts')),
+      inspectNativeHookGuard(projectRoot, writeRequest('src/b.ts')),
+    ]);
+
+    expect(results).toEqual([
+      expect.objectContaining({ allowed: true, phase: 'build' }),
+      expect.objectContaining({ allowed: true, phase: 'build' }),
+    ]);
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'build',
+      loop: { iteration: 2 },
+      builder_handoff: {
+        review: { reviewer_execution_ref: 'concurrent-guard-reviewer' },
+      },
+    });
+  });
+
+  it('preserves a Verify candidate for resource messages and still invalidates mixed file writes', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-resource-targets');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+      },
+    });
+    const before = await readNativePortableChange(paths, state.name);
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('agent:/Main', 'proc:/worker/kill', 'xd:/report_issue'),
+      ),
+    ).resolves.toMatchObject({ allowed: true });
+    expect(await readNativePortableChange(paths, state.name)).toEqual(before);
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('agent:/Main', 'src/new-file.ts')),
+    ).resolves.toMatchObject({ allowed: true, phase: 'build' });
+  });
+
+  it('keeps a portable Verify candidate valid for neutral document writes', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-doc-write');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('doc-write-reviewer'),
+      },
+    });
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('README.md', 'docs/guide.md')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'verify',
+      reason: expect.stringContaining('neutral document'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'verify',
+      builder_handoff: { candidate_id: 'candidate' },
+    });
+  });
+
+  it('still invalidates a portable Verify candidate when a material write mixes with documents', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-mixed-write');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('mixed-write-reviewer'),
+      },
+    });
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('README.md', 'src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'build',
+      reason: expect.stringContaining('candidate was invalidated'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'build',
+    });
+  });
+
+  it('keeps every Native formal artifact protected under the default docs artifact root', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+    const { paths, state } = await portableBuild('docs-artifact-verify', 'docs');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('docs-artifact-reviewer'),
+      },
+    });
+    const changeDir = nativePortableChangeDir(paths, state.name);
+
+    // Ordinary docs-tree documentation next to the artifact root stays neutral
+    // while the candidate is still under verification.
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('docs/guide.md')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'verify',
+      reason: expect.stringContaining('neutral document'),
+    });
+    // Neutral documentation inside the artifact tree never applies: the brief
+    // is a formal requirement write and returns the change to Shape.
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(path.join(changeDir, 'brief.md'))),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'shape',
+      reason: expect.stringContaining('returned to Shape'),
+    });
+    // Runtime-owned state stays denied even in Shape.
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(path.join(changeDir, 'comet-state.yaml'))),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Runtime-owned'),
+    });
+    // Published specs keep their Archive-only recovery path.
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest(path.join(paths.specsDir, 'capability', 'spec.md')),
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Published Native specs are updated through Archive'),
+    });
+  });
+
+  it('reverts portable Verify document writes to Build under native.document_writes: revert', async () => {
+    const defaults = defaultProjectConfig('.');
+    await writeProjectConfig(projectRoot, {
+      ...defaults,
+      native: { ...defaults.native, document_writes: 'revert' },
+    });
+    const { paths, state } = await portableBuild('portable-doc-revert');
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'builder',
+        }),
+        candidateId: 'candidate',
+        summary: 'Built.',
+        addressedAcceptanceIds: state.acceptance.map(({ id }) => id),
+        acceptanceReview: fixtureAcceptanceReview(state.acceptance.map(({ id }) => id)),
+        review: passedReview('doc-revert-reviewer'),
+      },
+    });
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('README.md')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'build',
+      reason: expect.stringContaining('candidate was invalidated'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'build',
+    });
+  });
+
+  it('allows legacy-phase neutral document writes while denying implementation writes', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths: verifyPaths } = await activeChange('verify', 'legacy-doc-write');
+    await selectNativeChange(verifyPaths, 'legacy-doc-write');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('docs/guide.md')),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'verify',
+      reason: expect.stringContaining('neutral document'),
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('commandAlternative'),
+    });
+  });
+
+  it('returns a portable Build change to Shape before allowing formal requirement edits', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-shape-write');
+    const childrenRef = path
+      .relative(projectRoot, path.join(nativePortableChangeDir(paths, state.name), 'children.yaml'))
+      .replaceAll('\\', '/');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(childrenRef)),
+    ).resolves.toMatchObject({
+      allowed: true,
+      phase: 'shape',
+      reason: expect.stringContaining('requirements changed'),
+    });
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      phase: 'shape',
+      acceptance: [],
+    });
+  });
+
+  it('rejects a non-canonical file inside a Native change Specs directory', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('portable-wrong-spec-path');
+    const wrongPath = path
+      .relative(
+        projectRoot,
+        path.join(nativePortableChangeDir(paths, state.name), 'specs', 'auth', 'wrong.md'),
+      )
+      .replaceAll('\\', '/');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest(wrongPath)),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('spec.md'),
+      phase: 'build',
+      change: state.name,
+    });
+  });
+
+  it('returns phase-specific guidance for legacy implementation writes outside Build', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+
+    const { paths: shapePaths } = await activeChange('shape', 'shape-write');
+    await selectNativeChange(shapePaths, 'shape-write');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('execute the Shape confirmation command'),
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      reason: expect.not.stringContaining('--revise-implementation'),
+    });
+
+    const { paths: verifyPaths } = await activeChange('verify', 'verify-write');
+    await selectNativeChange(verifyPaths, 'verify-write');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('commandAlternative'),
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      reason: expect.stringContaining('--expected-state-version'),
+    });
+
+    const { paths: archivePaths } = await activeChange('archive', 'archive-write');
+    await selectNativeChange(archivePaths, 'archive-write');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Continue finalizing the accepted result'),
+    });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      reason: expect.not.stringContaining('--revise-implementation'),
+    });
+  });
+
+  it('returns a structured Copilot denial without relying on exit code 2', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange('shape', 'copilot-shape');
+    const previousFilePath = process.env.FILE_PATH;
+    process.env.FILE_PATH = 'src/index.ts';
+    try {
+      const result = await runNativeCli([
+        'hook-guard',
+        '--hook-output',
+        'copilot',
+        '--project-root',
+        projectRoot,
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout ?? '')).toEqual({
+        permissionDecision: 'deny',
+        permissionDecisionReason: expect.stringContaining('execute the Shape confirmation command'),
+      });
+      expect(JSON.parse(result.stdout ?? '').permissionDecisionReason).not.toContain(
+        '--revise-implementation',
+      );
+    } finally {
+      if (previousFilePath === undefined) delete process.env.FILE_PATH;
+      else process.env.FILE_PATH = previousFilePath;
+    }
+  });
+
+  it('requires the CLI before creating a Native formal artifact without an active change', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+
+    const canonical = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest('docs/comet/changes/example/brief.md'),
+    );
+    expect(canonical).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('comet native new example'),
+    });
+    expect(canonical.reason).toContain('artifacts.briefPath');
+    expect(canonical.reason).toMatch(/read.*merge/iu);
+    expect(canonical.reason).not.toContain('retry the same write');
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({ allowed: true, reason: 'No Native changes exist' });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('docs/notes/brief.md')),
+    ).resolves.toMatchObject({ allowed: true, reason: 'No Native changes exist' });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('other/comet/changes/example/brief.md')),
+    ).resolves.toMatchObject({ allowed: true, reason: 'No Native changes exist' });
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('.comet/comet/changes/fake/brief.md')),
+    ).resolves.toMatchObject({ allowed: true, reason: 'No Native changes exist' });
+  });
+
+  it('protects Native Runtime files even while an implementation is in Build', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+    await activeChange('build', 'runtime-protection', 'docs');
+
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('.comet/runtime/native/changes/runtime-protection/state.json'),
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Runtime-owned'),
+    });
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('docs/comet/changes/runtime-protection/comet-state.yaml'),
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('Runtime-owned'),
+    });
+  });
+
+  it('does not let legacy Build bypass published Native Specs', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+    await activeChange('build', 'legacy-build', 'docs');
+
+    const decision = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest('docs/comet/specs/authentication/spec.md'),
+    );
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('updated through Archive'),
+    });
+    expect(decision.reason).toContain(
+      path.join(
+        projectRoot,
+        'docs',
+        'comet',
+        'changes',
+        'legacy-build',
+        'specs',
+        'authentication',
+        'spec.md',
+      ),
+    );
+    expect(decision.reason).toMatch(/read.*merge.*retry/iu);
+    expect(decision.reason).not.toContain('use comet native spec sync');
+    expect(decision.reason).not.toContain('revise-requirements');
+  });
+
+  it('does not guess that an association write intends to revoke it', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('association-write');
+    const associationRef = path
+      .relative(
+        projectRoot,
+        path.join(nativePortableChangeDir(paths, state.name), 'capability-association.yaml'),
+      )
+      .replaceAll('\\', '/');
+
+    const decision = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest(associationRef),
+      state.name,
+    );
+
+    expect(decision).toMatchObject({ allowed: false });
+    expect(decision.reason).toContain(`comet native status ${state.name} --json`);
+    expect(decision.reason).not.toContain('spec disassociate');
+  });
+
+  it('chooses one executable recovery for registered and unregistered foreign changes', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange('shape', 'selected-change');
+    await activeChange('shape', 'registered-change');
+
+    const registered = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest('comet/changes/registered-change/brief.md'),
+      'selected-change',
+    );
+    expect(registered.reason).toContain('comet native select registered-change');
+    expect(registered.reason).not.toContain('comet native new registered-change');
+
+    const unregistered = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest('comet/changes/unregistered-change/brief.md'),
+      'selected-change',
+    );
+    expect(unregistered.reason).toContain(
+      'comet native new unregistered-change --isolation worktree',
+    );
+    expect(unregistered.reason).not.toContain('comet native select unregistered-change');
+  });
+
+  it('redirects a known .comet Native artifact to the configured root', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+    await activeChange('build', 'wrong-root', 'docs');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('.comet/comet/changes/wrong-root/brief.md')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining(
+        path.join(projectRoot, 'docs', 'comet', 'changes', 'wrong-root', 'brief.md'),
+      ),
+    });
+  });
+
+  it('allows control-only writes but blocks mixed control and implementation targets', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs'));
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    await ensureNativeDirectories(paths);
+    await createNativeChange({
+      paths,
+      name: 'guard-control',
+      language: 'en',
+      verificationProtocol: 'legacy-v1',
+    });
+
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('.comet/config.yaml', 'docs/comet/changes/guard-control/brief.md'),
+      ),
+    ).resolves.toMatchObject({ allowed: true, reason: 'Native control artifact write' });
+    await expect(
+      inspectNativeHookGuard(
+        projectRoot,
+        writeRequest('docs/comet/changes/guard-control/brief.md', 'src/index.ts'),
+      ),
+    ).resolves.toMatchObject({ allowed: false, phase: 'shape' });
+  });
+
+  it('reports every Native problem in one portable multi-target rejection', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const { paths, state } = await portableBuild('aggregate-targets');
+
+    const decision = await inspectNativeHookGuard(
+      projectRoot,
+      writeRequest(
+        'comet/changes/other-change/brief.md',
+        '.comet/runtime/native/changes/aggregate-targets/state.json',
+        'comet/changes/aggregate-targets/specs/authentication/notes.md',
+      ),
+      state.name,
+    );
+
+    expect(decision).toMatchObject({ allowed: false, change: state.name });
+    expect(decision.reason).toContain('belongs to unregistered change other-change');
+    expect(decision.reason).toContain('Runtime-owned path');
+    expect(decision.reason).toContain('notes.md');
+  });
+
+  it.each(['.github/workflows/ci.yml', '.husky/pre-commit', '.env', '.gitignore'])(
+    'guards dot-prefixed project write %s',
+    async (target) => {
+      await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+      await activeChange('shape', 'guard-dotfiles');
+
+      await expect(
+        inspectNativeHookGuard(projectRoot, writeRequest(target)),
+      ).resolves.toMatchObject({ allowed: false, phase: 'shape' });
+    },
+  );
+
+  it('does not guard a Classic-only project', async () => {
+    const config = defaultProjectConfig('.');
+    config.default_workflow = 'classic';
+    config.workflows = ['classic'];
+    await writeProjectConfig(projectRoot, config);
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({ allowed: true, reason: 'Native workflow is not enabled' });
+  });
+
+  it('blocks writes when multiple active changes have no valid selection', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    await activeChange('build', 'build-change');
+    await activeChange('shape', 'shape-change');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('select the change'),
+    });
+  });
+
+  it('uses the selected change when multiple Native changes are active', async () => {
+    await writeProjectConfig(projectRoot, defaultProjectConfig('.'));
+    const paths = await nativeProjectPaths(projectRoot, '.');
+    await ensureNativeDirectories(paths);
+    await createNativeChange({
+      paths,
+      name: 'shape-change',
+      language: 'en',
+      verificationProtocol: 'legacy-v1',
+    });
+    const buildChange = await createNativeChange({
+      paths,
+      verificationProtocol: 'legacy-v1',
+      name: 'build-change',
+      language: 'en',
+    });
+    buildChange.phase = 'build';
+    await writeNativeChange(paths, buildChange);
+    await selectNativeChange(paths, 'build-change');
+
+    await expect(
+      inspectNativeHookGuard(projectRoot, writeRequest('src/index.ts')),
+    ).resolves.toMatchObject({ allowed: true, phase: 'build', change: 'build-change' });
+  });
+});

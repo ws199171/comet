@@ -1,204 +1,256 @@
 ---
 name: comet-hotfix
-description: "Comet preset path: Bug fix / hotfix. Skip brainstorming, directly open → build → verify → archive. Applicable for behavior fixes, scenarios not involving new capability design."
+description: 'Use the Classic preset to repair a localized defect. Use when the user explicitly invokes /comet-hotfix, selects hotfix, or resumes workflow: hotfix.'
 ---
 
-# Comet Preset Path: Hotfix
+# Comet Preset: Hotfix
 
-Quick bug fix workflow: open → build → verify → archive. Skip brainstorming and full plan, applicable for behavior fixes not involving new capability design.
+Before starting or resuming, read and follow `comet-classic/reference/classic-layout.md`. All OpenSpec CLI calls must use the adapter, and all paths must use the bound `<classic-*>` logical roots.
 
-**Applicable conditions** (all must be met):
-1. Fix bugs in existing functionality, no new capability
-2. No interface changes or architecture adjustments
-3. Change scope is predictable (usually ≤ 2 files)
+A short defect-repair flow: open → build → root cause check → verify → archive. It skips brainstorming and a full implementation plan, and applies to repairing existing behavior without designing new features.
 
-**Not applicable**: If fix process discovers need for architecture adjustments, should upgrade to full `/comet` workflow.
+**All applicability conditions must hold:**
+
+1. Repair an existing feature's defect without adding a feature.
+2. No interface changes or architectural redesign.
+3. The scope can be estimated. File counts are only a prompt for review, not an automatic escalation rule; see “Escalation decisions.”
+
+**When the preset may no longer fit:** If the repair encounters changes listed under “Escalation decisions,” let the user decide whether to use the full `/comet-classic` flow.
 
 ---
 
-## Process (preset workflow, 6 steps)
+## Preset flow: 6 steps
 
-### 0. Output Language Constraint
+### 0. Set the output language
 
-Streamlined OpenSpec artifacts must use the language of the user request that triggered this workflow.
+Use Comet's configured artifact language for the reduced OpenSpec artifacts. Before `.comet.yaml` exists, read `classic.language` from project `.comet/config.yaml`, then global `~/.comet/config.yaml`. After initialization, read it with `comet state get <name> language`.
 
-Execution chain: open → build → root cause check → verify → archive. Hotfix provides default decisions for each phase: streamlined open, direct build, root cause confirmation, scale-based verification, and final archive confirmation after verification passes.
+Execution order: open → build → root cause check → verify → archive. Hotfix presets how each stage runs: prepare the necessary artifacts, implement directly, check that the root cause is eliminated, choose verification based on size, then request final archive confirmation after verification passes.
 
-Locate Comet scripts before starting:
+Use the supported Comet CLI described in `comet-classic/reference/scripts.md`. On recovery from any entry, first check phase/workflow under `comet-classic/reference/context-recovery.md`.
+
+For an existing hotfix, the first state operation must be `comet state select <change-name>`. For a new change, run it immediately after `.comet.yaml` initializes successfully and before source edits.
+
+After entering the hotfix workspace and reading current `phase`, run `comet task <project-root> --task "<original-user-request>" --phase "<phase>" --session "<stable-task-session-id>" --json`. Use the returned context as follows:
+
+- Add only returned `text` to the current context. Context Manifest (`manifest` / `<context_manifest>`) contains only summaries, application reasons, and stable IDs. Add `--expand-context "<id>"` when source text, provenance, or validation details are needed. When path, operation, or phase changes, select applicable entries again using the same `--session`.
+- Use `comet memory remember ... --scope global|project` when the user explicitly asks for long-term memory. Use `comet memory observe` only for implicit, reusable, stable collaboration patterns. Do not save task summaries, progress, command output, or test results.
+- Before task completion, write project-validated and reusable experience to Project Memory with `comet knowledge remember <project-root> --title "<concise title>" --text "<symptom, approach, verification>" --type <fact|decision|pattern|procedure|constraint|failure-resolution> --json`. The same title updates the existing entry; skip the write when nothing is reusable, and never save task summaries, one-off command output, or unverified guesses in Project Memory.
+- After actually using an entry and determining its outcome, take `applications[].applicationId` (`application_id` in Hook text) and run `comet task <project-root> --task "<original-user-request>" --application "<application-id>" --outcome used-successfully|ignored|overridden|corrected|contributed-to-failure --json` to record the result.
+- Before task completion, complete one learning check: when a user correction, preference, or collaboration habit has a clear reuse condition, call `comet memory observe` and pass `--learning-check submitted` to the completion command; pass `--learning-check no-observation` when you checked and found none, or `--learning-check not-run` when no check occurred. Use observation JSON `learning.result` and `status.learning.lastCheck` to distinguish candidate, promotion, deduplication, and skip; do not submit task summaries or test results.
+- At task completion, still run `comet task` with `--complete --workflow <workflow> --change <change-id> --learning-check submitted|no-observation|not-run`. Without Hooks, this Skill uses the same interface. `comet memory context` is a compatibility entry only. Plugin failures do not block the repair.
+
+### 1. Open a minimal change
+
+Reuse Comet Open with hotfix defaults. Skip the full `openspec-explore` exploration and create only the artifacts needed for the repair.
+
+**Required now:** Load `openspec-new-change` using the Skill tool. Do not skip this step.
+
+<!-- external-openspec-skill-override -->
+
+**Adapt external OpenSpec instructions:** Do not directly invoke the official CLI, adopt a fixed cwd, or read/write fixed physical OpenSpec paths. Use `comet classic openspec -- <args...>` for every OpenSpec command and this invocation's `<classic-*>` logical roots for all change and artifact paths.
+
+Workspace isolation is a user choice made before state initialization; do not write `current` as an assumed default (choosing a worktree after initialization fails: the change directory only appears in the primary root, not in the worktree). Pause under `comet-classic/reference/decision-point.md` and present:
+
+- A. Work on the current branch (`--isolation current`, binding the actual branch).
+- B. Create a branch: create and switch to `hotfix/YYYYMMDD/<change-name>` (`--isolation branch`).
+- C. Create a worktree: first load Superpowers `using-git-worktrees` with the Skill tool and let it create the isolated workspace (`--isolation worktree`).
+
+Then prepare the workspace and initialize plus select the change inside the returned `projectRoot` (resume follows the same order):
 
 ```bash
-COMET_ENV="${COMET_ENV:-$(find . "$HOME"/.*/skills "$HOME/.config" "$HOME/.gemini" -path '*/comet/scripts/comet-env.sh' -type f -print -quit 2>/dev/null)}"
-if [ -z "$COMET_ENV" ]; then
-  echo "ERROR: comet-env.sh not found. Ensure the comet skill is installed." >&2
-  return 1
-fi
-. "$COMET_ENV"
+comet classic workspace prepare <name> --isolation <selected-isolation> --json
+cd <returned projectRoot>
+comet state init <name> hotfix --isolation <selected-isolation>
+comet state select <name>
+comet state check <name> open
 ```
 
-### 1. Quick Open (preset open)
+If select/check returns `BLOCKED` — or a branch-binding `ERROR` — because `bound_branch` differs from the current branch, pause under `comet-classic/reference/decision-point.md`. Offer a single choice: return to the bound branch and rerun entry checks, or, after the user explicitly confirms that the current branch should take over this change, run `comet state rebind <change-name>` and rerun entry checks. Do not switch or rebind branches yourself.
 
-Reuse Comet open capability to create change, but use hotfix defaults: do not execute `openspec-explore` long exploration, directly enter streamlined change creation.
+Then create the reduced artifacts:
 
-**Immediately execute:** Use the Skill tool to load the `openspec-new-change` skill. Skipping this step is prohibited.
+- `proposal.md`: problem, root cause, and repair goal; no solution comparison required.
+- `design.md`: the repair approach; one approach is enough.
+- `tasks.md`: repair tasks.
+- **No delta spec is required** unless the fix changes acceptance scenarios in an existing spec.
 
-After the skill loads, follow its guidance to create streamlined artifacts:
-  - `proposal.md` — problem description + root cause analysis + fix goal (no solution comparison needed)
-  - `design.md` — fix solution (one is enough, no multi-solution comparison needed)
-  - `tasks.md` — fix task list
-- **No delta spec needed** (unless fix changes existing spec acceptance scenarios)
-
-Initialize Comet state file:
+Apply the phase guard to move from open to build:
 
 ```bash
-"$COMET_BASH" "$COMET_STATE" init <name> hotfix
-```
-
-Verify initialized state:
-
-```bash
-"$COMET_BASH" "$COMET_STATE" check <name> open
-```
-
-Run phase guard to transition open → build:
-
-```bash
-"$COMET_BASH" "$COMET_GUARD" <change-name> open --apply
+comet guard <change-name> open --apply
 ```
 
 Check `auto_transition` to decide whether to continue:
 
 ```bash
-"$COMET_BASH" "$COMET_STATE" next <name>
+comet state next <name>
 ```
 
-- `NEXT: auto` → continue to Step 2
-- `NEXT: manual` → pause, follow `HINT` to prompt user to run `/<SKILL>` manually
+- `NEXT: auto`: continue to Step 2.
+- `NEXT: manual`: follow `HINT`, return control, and end this invocation. Do not ask for another continuation approval.
 
-### 2. Direct Build (preset build)
+### 2. Implement directly
 
-Use hotfix defaults: `build_mode: direct`. Skip Superpowers `brainstorming` and `writing-plans` (unless tasks > 3; if exceeds 3 tasks, transfer to `/comet-build`'s plan and execution method selection — note this does NOT trigger full workflow upgrade, only switches execution method).
+Use hotfix defaults: `build_mode: direct`, `tdd_mode: direct`, `review_mode: off`. Preserve the isolation confirmed in Step 1; do not change it back to `current`.
 
-Before continuing or starting changes, handle uncommitted changes through `comet/reference/dirty-worktree.md`. If attribution shows the fix scope exceeds hotfix, handle it through this file's "Upgrade Conditions".
+`direct` skips full planning and per-task TDD orchestration; it still requires reproduction, regression tests, and verification. Skip Superpowers `brainstorming` and `writing-plans`. **Task count alone does not trigger `/comet-build`.** Execute even a longer tasks.md in order within the current hotfix. Ask whether to escalate to full only when a later escalation condition applies, or when the file-count threshold is exceeded without valid authorization.
 
-**Immediately execute:** Execute tasks one by one according to tasks.md:
+Before starting or resuming edits, handle uncommitted changes under `comet-classic/reference/dirty-worktree.md`. After establishing ownership, apply “Escalation decisions” if the repair meets an escalation condition or exceeds the file-count prompt.
 
-1. Read `openspec/changes/<name>/tasks.md`, get incomplete task list
-2. For each incomplete task:
-   - Modify code according to task description
-   - Run project formatter (e.g., `mvn spotless:apply`, `npm run format`)
-   - Run related tests to confirm pass
-   - Check corresponding `- [ ]` to `- [x]` in tasks.md
-   - Commit code, commit message format: `fix: <brief fix description>`
-3. After all tasks complete, explicitly run relevant project tests and build commands
+Before changing implementation, **reproduce the issue and record the failure**:
 
-**If fix affects existing spec acceptance scenarios**:
-- Create delta spec in `openspec/changes/<name>/specs/<capability>/spec.md`
-- Only include `## MODIFIED Requirements` section
+1. Confirm the reported old behavior actually fails with minimal repeatable steps. Record the command, input, and actual result.
+2. Where automation is possible, add and run a failing regression test first. Confirm that it fails for this defect, not an environment or test error.
+3. Where automation is not currently possible, record why and provide repeatable manual failure evidence in the proposal/verification report. Do not edit code without failure evidence.
 
-During hotfix execution, whenever a crash, unexpected behavior, test failure, or build failure appears while running the program, tests, build, or manual verification, must use the Skill tool to load the Superpowers `systematic-debugging` skill. Before root-cause investigation is complete, must not propose or implement source-code fixes.
+After obtaining RED evidence, execute tasks.md in order:
 
-For specific investigation, minimal failing test, fix verification, and keeping the current change verification loop, follow `comet/reference/debug-gate.md`.
+1. Read `<classic-change-dir>/tasks.md` for unfinished tasks.
+2. For each task:
+   - Implement the described repair.
+   - Run the project's formatter, such as `mvn spotless:apply` or `npm run format`.
+   - Run the new regression test until it passes, then run relevant tests.
+   - Change its tasks.md `- [ ]` to `- [x]`.
+   - Commit using `fix: <repair-summary>`.
+3. Explicitly run the relevant project tests and build after all tasks are complete.
 
-### 3. Root Cause Elimination Check
+During hotfix, a crash, unexpected behavior, failing test, or failing build encountered while running the program, tests, build, or manual verification requires loading Superpowers `systematic-debugging` through the Skill tool. Do not propose or implement source repairs before completing root-cause investigation.
 
-**Execute before running build guard**, ensuring the fix actually eliminates the root cause:
+Follow `comet-classic/reference/debug-gate.md` for investigation, the minimal failing test, verification after repair, and completing those steps in the current change.
 
-1. Read bug description and root cause in proposal.md
-2. Search and verify problem code no longer exists
-3. If root cause not eliminated, return to Step 2 to continue fix (still in build phase, no state transition needed)
+**If the fix affects existing spec acceptance scenarios:**
 
-**Upgrade conditions**:
-- Root cause check reveals deep architecture issues → Stop hotfix, handle per "Upgrade Conditions" section
-- Fix requires additional interface changes → Stop hotfix, handle per "Upgrade Conditions" section
+- Create `<classic-change-dir>/specs/<capability>/spec.md` as a delta spec.
+- Include only `## MODIFIED Requirements`.
 
-After root cause is confirmed eliminated, run phase guard to transition build → verify:
+### 3. Confirm the root cause is eliminated
+
+**Do this before the build guard** to confirm that the repair actually removes the cause:
+
+1. Read the bug description and root cause in proposal.md.
+2. Search the relevant code and confirm the faulty implementation has been removed or corrected.
+3. If the cause remains, return to Step 2. Phase is still build, so no state rollback is needed.
+
+**Escalation prompts:**
+
+- The check reveals a deeper architecture issue: pause under “Escalation decisions” and let the user choose whether to use the full flow.
+- The repair needs another interface change, such as a new public API: pause under the same section for the user's decision.
+
+After confirming elimination, advance from build to verify:
 
 ```bash
-"$COMET_BASH" "$COMET_GUARD" <change-name> build --apply
+comet guard <change-name> build --apply
 ```
 
-State automatically updates to `phase: verify`, `verify_result: pending`, then enter verification.
+State becomes `phase: verify`, `verify_result: pending`; continue to verification.
 
-### 4. Verification (preset verify)
+### 4. Verify
 
-Reuse `/comet-verify`, with comet-verify's scale assessment deciding lightweight or full verification.
+Reuse `/comet-verify`, whose size assessment chooses light or full verification.
 
-**Immediately execute:** Use the Skill tool to load the `comet-verify` skill. Skipping this step is prohibited.
+**Required now:** Load `comet-verify` using the Skill tool. Do not skip this step.
 
-Small-scale hotfixes without delta spec usually meet lightweight verification conditions (≤ 3 tasks, ≤ 2 files), comet-verify's scale assessment will select the lightweight verification path (6 quick checks, including lightweight code review). If hotfix created delta spec, enter full verification path according to comet-verify's scale assessment rules.
+A small hotfix without delta spec usually meets light conditions (≤ 3 tasks and changed files below the scale threshold). Follow comet-verify's light-verification checklist. Default `review_mode: off` does not dispatch automatic code review. If the user wants review, they can set `comet state set <name> review_mode standard` or `thorough` before verification. If the hotfix creates delta spec, follow comet-verify's scale rules into full verification.
 
-After verification passes, record `.comet.yaml` `verify_result` as `pass` according to `/comet-verify` rules, must not skip this status before archiving. After verification passes, still enter `/comet-archive`'s final archive confirmation; do not automatically run the archive script.
+After verification and its report are complete, `/comet-verify` runs `comet guard <change-name> verify --apply`. Reuse its successful archive state and `agent.continuation`; do not manually set `verify_result: pass` or repeat Guard. If Guard fails, address its reasons without claiming acceptance passed. `/comet-archive` still requires final confirmation before archiving; never run archive automatically.
 
-### 5. Archive (preset archive)
+### 5. Archive
 
-Reuse `/comet-archive`. Must satisfy `verify_result: pass` in `.comet.yaml` before archiving, and wait for `/comet-archive`'s final archive confirmation.
+Reuse `/comet-archive`. Require `.comet.yaml` `verify_result: pass` and wait for its final archive confirmation.
 
-**Immediately execute:** Use the Skill tool to load the `comet-archive` skill to archive. Skipping this step is prohibited.
-If there is delta spec, sync to main spec according to comet-archive rules, and handle associated Design Doc and Plan archiving annotations.
+**Required now:** Load `comet-archive` using the Skill tool. Do not skip this step.
+
+If there is delta spec, sync it to main spec under comet-archive rules and apply archive annotations to the linked Design Doc and Plan.
 
 ---
 
-## Continuous Execution Mode
+## Continue through the preset
 
 <IMPORTANT>
-Hotfix workflow is **one-time continuous execution**. After invoking `/comet-hotfix`, agent must automatically advance through hotfix steps, without pausing to wait for user input mid-way.
+Hotfix runs continuously by default. After `/comet-hotfix`, automatically move through its own steps without extra pauses. If `auto_transition: false`, end the invocation between build/verify/archive phases and use `HINT` to tell the user how to invoke the next phase later. Do not add another confirmation question. Regardless of auto_transition, pause for these user decisions:
 
-Exception: when `.comet.yaml` has `auto_transition: false`, after each phase guard advances `phase`, do not auto-invoke the next skill. In this case, use `"$COMET_BASH" "$COMET_STATE" next <name>` output and pause for manual continuation as instructed.
+1. An escalation condition appears: **pause, present choices, and wait for an explicit decision** to continue hotfix or move to the full `/comet-classic` flow.
+2. Verify needs acceptance of a WARNING/SUGGESTION deviation, a spec-divergence decision, or a strategy after the automatic repair limit. The first 3 clearly repairable failures are repaired and reverified automatically.
+3. The final pre-archive choice of whether to archive and how to deliver the archive commit.
 
-The following situations must also pause and wait for user confirmation:
+Order: quick Open → direct Build → root-cause elimination check → Verify → Archive → done.
 
-1. Encountering upgrade conditions (see "Upgrade Conditions" section). **Must use the current platform's available user input/confirmation mechanism to pause and wait for the user to explicitly confirm** upgrading to full workflow
-2. workspace isolation and execution-method selection when tasks exceed 3 and transfer to `/comet-build`
-3. verify phase (comet-verify) verification-failure and branch-handling decisions
-4. Final archive confirmation (before comet-archive runs the archive script)
-
-Execution order: quick open → direct build → root cause check → verification → archive → complete
-
-After each step completes, immediately enter next step. Within each phase, must still call corresponding Comet/OpenSpec/Superpowers skill according to above requirements; if the called skill has its own user decision points, follow that skill's rules.
+Continue to the next phase as soon as the current one finishes, subject to the rules above. Still invoke the required Comet/OpenSpec/Superpowers skills within each phase. If a called skill has a user decision, follow its rules.
 </IMPORTANT>
 
 ---
 
-## Upgrade Conditions
+## Escalation decisions
 
-Upgrade to full `/comet` when **any** of the following conditions are met:
+Escalation decides only whether to replace the preset with full. File count does not automatically upgrade the workflow. `comet state scale` recommends light/full verification without writing configuration; Verify chooses based on actual risk.
 
-| Condition | Explanation |
-|-----------|-------------|
-| Change involves **3+ files** | Exceeds single-point fix scope |
-| Architecture changes | New modules, new interfaces, new dependencies |
-| Database schema changes | Structural adjustments |
-| Introduces new public API | Fix creates new external interface |
-| Fix scope exceeds single function/module | Requires coordinated changes |
+If `/comet-classic` passes an intent frame, before Build recheck only `risk_signal` and whether work adds a feature or public API, changes a structured-data schema, needs cross-module coordination, or exposes a deeper architecture issue. Follow this section when these arise; do not repeat entry intent classification.
 
-When upgrade conditions are met, **must follow the `comet/reference/decision-point.md` protocol to pause and wait for the user to explicitly confirm** upgrading to the full `/comet` workflow. Do not directly enter `/comet-design`, and do not automatically supplement Design Doc.
+During repair, watch for:
 
-After user confirms upgrade, **must first update the workflow and phase fields** before entering full flow:
+- Coordinated edits across modules.
+- A new feature.
+- Database schema changes.
+- A new public API.
+- A deeper architecture issue, often discovered by the root-cause elimination check.
 
-```bash
-"$COMET_BASH" "$COMET_STATE" set <name> workflow full
-"$COMET_BASH" "$COMET_STATE" set <name> phase design
+For any of these, the Agent **must neither escalate nor decide to stay on hotfix without the user**.
+
+File count prompts a scope review only; it is not a substantive escalation signal. When delivery files exceed the prompt threshold, such as > 4 files, first count the current change's delivery files and check for valid authorization below. More files do not necessarily require the full flow. Defect repairs usually involve 1–3 files; exceeding the threshold warrants checking whether the preset still fits.
+
+Delivery files include only implementation/source, tests, user documentation, configuration, and generated output. Count committed changes after the confirmed baseline together with staged, unstaged, and untracked files, deduplicated by path. Exclude OpenSpec artifacts in the current change directory, `.comet` metadata, and unrelated dirty files. Do not count OpenSpec artifacts or unrelated dirty files toward the threshold, and do not skip substantive-signal checks because the file count is small.
+
+### Reusing explicit authorization for a file-count-only prompt
+
+Only an explicit authorization from the user of the current change to continue when the scope and risk are unchanged and file count is the only trigger can create or reuse authorization. Ordinary “start repairing” instructions, Skill invocation, historical preferences, and Personal Memory are not authorization. Store it only in `<classic-change-dir>/.comet/rulings.md` using this stable structure; if the change directory does not exist yet, keep the record pending and do not assume authorization exists:
+
+```text
+### Preset file-count authorization
+- status: active|invalidated
+- workflow: hotfix
+- decision: continue-on-file-count-only
+- scope: <confirmed scope of the current change>
+- allowed-file-categories: implementation, tests, user-docs, config, generated
+- authorization-basis: user-explicit
+- reason: <basis and reason supplied by the user>
 ```
 
-Then on current change basis, supplement Design Doc: **Immediately use the Skill tool to load the `comet-design` skill**, proceed normally with full workflow. If user does not confirm upgrade, stop hotfix and report that current change has exceeded hotfix scope.
+When the file-count threshold is first exceeded without a valid ruling, pause under `comet-classic/reference/decision-point.md` and ask the user to choose continue hotfix (A) or escalate to full (B). Write the ruling only after the user explicitly chooses A and confirms that scope and risk are unchanged and file count is the only trigger; later growth within the same scope can reuse `status: active` without asking again. With valid authorization, do not ask, but first report the total file count, category breakdown, mapping to the confirmed scope, the ruling location, and the evidence that no substantive escalation signal was found, then continue hotfix. Verification depth still follows actual risk and the `comet state scale` recommendation.
+
+When resuming a task, read the current change's ruling first. A valid `status: active` record is reused under the same conditions; `status: invalidated`, missing, unreadable, ambiguous, or scope-mismatched records require pausing and offering continue hotfix or escalate to full again.
+
+`status: active` is valid only when `workflow` matches hotfix, scope, acceptance, and risk assumptions are unchanged, all new delivery files remain within `allowed-file-categories`, and file count is the only trigger. If the user revokes authorization, the workflow changes, scope or acceptance changes, a new module/API/schema/capability/architecture issue appears (for example, a new public API or structured-data schema change), or a file falls outside the authorized categories, mark the record `status: invalidated` and return to the pause. If `rulings.md` is missing, unreadable, ambiguous, or invalid, there is no valid authorization and the Agent must pause; when escalating to full, also mark it `status: invalidated` and do not reuse it.
+
+Therefore, any substantive escalation signal, or a file-count threshold exceeded without valid authorization, requires pausing under `comet-classic/reference/decision-point.md` and waiting for an explicit choice. Do not enter `/comet-design` or create a Design Doc automatically.
+
+After the user chooses escalation (B), run the supported state-machine transition to full and return to design:
+
+```bash
+comet state transition <name> preset-escalate
+```
+
+It atomically sets `workflow`/`classic_profile` to `full`, moves `phase` to `design`, clears `design_doc`, and clears preset-specific `build_mode`, `tdd_mode`, `review_mode`, `isolation`, and `verify_mode`, together with workspace bindings such as `bound_branch` — before entering Build, re-decide isolation and rebind (`state set <name> isolation ...`) under `comet-classic/reference/decision-point.md`, or guard will reject the missing isolation. **Immediately load `comet-design` using the Skill tool** to complete the design within the existing change. On entering Build, jointly reconfirm the complete working configuration.
+
+If the user chooses to continue (A), continue hotfix only after they explicitly confirm that scope and risk are unchanged and file count is the only trigger, and record the authorization basis and reason in the structure above. A bare “start repairing” or “continue” without that authorization meaning is not sufficient; pause for clarification.
 
 ---
 
-## Exit Conditions
+## Exit conditions
 
-- Bug fixed, tests pass
-- Change archived
-- If spec changes, synced to main spec
-- **Phase guard**: Before build → verify run `"$COMET_BASH" "$COMET_GUARD" <change-name> build --apply`; before verify → archive follow `/comet-verify` and run `"$COMET_BASH" "$COMET_GUARD" <change-name> verify --apply`
+- The defect is fixed and tests pass.
+- The change is archived.
+- Any spec changes are synced to main spec.
+- **Phase guards:** use `comet guard <change-name> build --apply` before build → verify, and follow `/comet-verify` to run `comet guard <change-name> verify --apply` before verify → archive.
 
-## Automatic Handoff to Next Phase
+## Continue to the next phase
 
-Follow `comet/reference/auto-transition.md`. Key command:
+Follow `comet-classic/reference/auto-transition.md` and `agent.continuation` from the successful result. Do not repeat next, select, or check while valid state information is available. Run this only after context loss, external state changes, or when an older result lacks that information:
 
 ```bash
-"$COMET_BASH" "$COMET_STATE" next <name>
+comet state next <name>
 ```
 
-- `NEXT: auto` → invoke the skill pointed to by `SKILL` to continue hotfix workflow (`phase: build` returns `comet-hotfix`, `verify` returns `comet-verify`, `archive` returns `comet-archive`)
-- `NEXT: manual` → do not invoke the next skill; prompt user to manually run `/<SKILL>` per `HINT`
-- `NEXT: done` → workflow is complete, no further action needed
+- `NEXT: auto`: invoke the skill named by `SKILL`: build returns `comet-hotfix`, verify returns `comet-verify`, and archive returns `comet-archive`.
+- `NEXT: manual`: do not invoke the next skill. Follow `HINT`, return control, and end this invocation without another confirmation question.
+- `NEXT: done`: the workflow is complete.

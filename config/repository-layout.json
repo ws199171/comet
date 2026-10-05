@@ -1,0 +1,503 @@
+{
+  "assetsRoot": "assets",
+  "manifestPath": "assets/manifest.json",
+  "skillsRoots": {
+    "en": "assets/skills",
+    "zh": "assets/skills-zh"
+  },
+  "classicRuntime": {
+    "entries": {
+      "runtime": "domains/comet-classic/classic-cli.ts",
+      "state": "domains/comet-classic/classic-state-entry.ts",
+      "check": "domains/comet-classic/classic-check-entry.ts",
+      "validate": "domains/comet-classic/classic-validate-entry.ts",
+      "guard": "domains/comet-classic/classic-guard-entry.ts",
+      "handoff": "domains/comet-classic/classic-handoff-entry.ts",
+      "archive": "domains/comet-classic/classic-archive-entry.ts",
+      "hookGuard": "domains/comet-classic/classic-hook-guard-entry.ts",
+      "intent": "domains/comet-classic/classic-intent-entry.ts",
+      "resume-probe": "domains/comet-classic/classic-resume-probe-entry.ts"
+    },
+    "outputs": {
+      "runtime": "assets/skills/comet/scripts/comet-runtime.mjs",
+      "state": "assets/skills/comet/scripts/comet-state.mjs",
+      "check": "assets/skills/comet/scripts/comet-check.mjs",
+      "validate": "assets/skills/comet/scripts/comet-yaml-validate.mjs",
+      "guard": "assets/skills/comet/scripts/comet-guard.mjs",
+      "handoff": "assets/skills/comet/scripts/comet-handoff.mjs",
+      "archive": "assets/skills/comet/scripts/comet-archive.mjs",
+      "hookGuard": "assets/skills/comet/scripts/comet-hook-guard.mjs",
+      "intent": "assets/skills/comet/scripts/comet-intent.mjs",
+      "resume-probe": "assets/skills/comet/scripts/comet-resume-probe.mjs"
+    }
+  },
+  "nativeRuntime": {
+    "entries": {
+      "runtime": "domains/comet-native/native-cli-entry.ts",
+      "hookGuard": "domains/comet-native/native-hook-guard-entry.ts",
+      "init": "domains/comet-native/native-init-entry.ts",
+      "root": "domains/comet-native/native-root-entry.ts",
+      "new": "domains/comet-native/native-new-entry.ts",
+      "spec": "domains/comet-native/native-spec-entry.ts",
+      "show": "domains/comet-native/native-show-entry.ts",
+      "status": "domains/comet-native/native-status-entry.ts",
+      "select": "domains/comet-native/native-select-entry.ts",
+      "next": "domains/comet-native/native-next-entry.ts",
+      "archive": "domains/comet-native/native-archive-entry.ts",
+      "doctor": "domains/comet-native/native-doctor-entry.ts"
+    },
+    "outputs": {
+      "runtime": "assets/skills/comet-native/scripts/comet-native-runtime.mjs",
+      "hookGuard": "assets/skills/comet-native/scripts/comet-native-hook-guard.mjs",
+      "init": "assets/skills/comet-native/scripts/comet-native-init.mjs",
+      "root": "assets/skills/comet-native/scripts/comet-native-root.mjs",
+      "new": "assets/skills/comet-native/scripts/comet-native-new.mjs",
+      "spec": "assets/skills/comet-native/scripts/comet-native-spec.mjs",
+      "show": "assets/skills/comet-native/scripts/comet-native-show.mjs",
+      "status": "assets/skills/comet-native/scripts/comet-native-status.mjs",
+      "select": "assets/skills/comet-native/scripts/comet-native-select.mjs",
+      "next": "assets/skills/comet-native/scripts/comet-native-next.mjs",
+      "archive": "assets/skills/comet-native/scripts/comet-native-archive.mjs",
+      "doctor": "assets/skills/comet-native/scripts/comet-native-doctor.mjs"
+    }
+  },
+  "entryRuntime": {
+    "entries": {
+      "runtime": "domains/comet-entry/entry-runtime-entry.ts",
+      "hookRouter": "domains/comet-entry/hook-router-entry.ts"
+    },
+    "outputs": {
+      "runtime": "assets/skills/comet/scripts/comet-entry-runtime.mjs",
+      "hookRouter": "assets/skills/comet/scripts/comet-hook-router.mjs"
+    }
+  },
+  "allowedTopLevelEntries": [
+    ".agents",
+    ".claude",
+    ".codegraph",
+    ".codex",
+    ".comet",
+    ".git",
+    ".gitattributes",
+    ".github",
+    ".gitignore",
+    ".gitmodules",
+    ".husky",
+    ".idea",
+    ".npmignore",
+    ".prettierignore",
+    ".prettierrc",
+    ".superpowers",
+    ".tmp",
+    "AGENTS.md",
+    "app",
+    "assets",
+    "bin",
+    "build.js",
+    "CHANGELOG.md",
+    "CLAUDE.md",
+    "codecov.yml",
+    "config",
+    "CONTRIBUTING-zh.md",
+    "CONTRIBUTING.md",
+    "coverage",
+    "dist",
+    "docs",
+    "domains",
+    "eslint.config.js",
+    "eval",
+    "img",
+    "LICENSE",
+    "node_modules",
+    "nul",
+    "package-lock.json",
+    "package.json",
+    "platform",
+    "pnpm-lock.yaml",
+    "README-zh.md",
+    "README.md",
+    "scripts",
+    "skills-lock.json",
+    "test",
+    "tsconfig.json",
+    "website",
+    "vitest.config.ts"
+  ],
+  "sourceRoots": ["app", "domains", "platform"],
+  "dependencyRules": {
+    "compatibilityFacades": [
+      {
+        "facade": "domains/comet-native/native-portable-runtime.ts",
+        "implementations": [
+          "domains/comet-native/native-portable-storage.ts",
+          "domains/comet-native/native-portable-requirements.ts",
+          "domains/comet-native/native-portable-checks.ts",
+          "domains/comet-native/native-portable-verification.ts",
+          "domains/comet-native/native-portable-coordination.ts",
+          "domains/comet-native/native-portable-shape-coordination.ts",
+          "domains/comet-native/native-portable-verifier-coordination.ts",
+          "domains/comet-native/native-portable-transitions.ts"
+        ]
+      },
+      {
+        "facade": "domains/comet-native/native-supervisor.ts",
+        "implementations": [
+          "domains/comet-native/native-supervisor-model.ts",
+          "domains/comet-native/native-supervisor-state.ts",
+          "domains/comet-native/native-supervisor-workspace.ts",
+          "domains/comet-native/native-supervisor-coordinator.ts"
+        ]
+      }
+    ],
+    "exceptions": [],
+    "pureModelModules": [
+      "domains/comet-native/native-change-model.ts",
+      "domains/comet-native/native-check-receipt-model.ts",
+      "domains/comet-native/native-supervisor-model.ts"
+    ],
+    "workflowCoreModules": [
+      "domains/comet-classic",
+      "domains/comet-native",
+      "domains/workflow-contract"
+    ],
+    "allowedDomainDependencies": [
+      {
+        "from": "bundle",
+        "to": "factory"
+      },
+      {
+        "from": "bundle",
+        "to": "skill"
+      },
+      {
+        "from": "bundle",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "comet-classic",
+        "to": "engine"
+      },
+      {
+        "from": "comet-classic",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "comet-classic",
+        "to": "skill"
+      },
+      {
+        "from": "comet-classic",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "comet-entry",
+        "to": "agent-learning"
+      },
+      {
+        "from": "comet-entry",
+        "to": "comet-classic"
+      },
+      {
+        "from": "comet-entry",
+        "to": "comet-native"
+      },
+      {
+        "from": "comet-entry",
+        "to": "comet-plugin"
+      },
+      {
+        "from": "comet-entry",
+        "to": "comet-memory"
+      },
+      {
+        "from": "comet-entry",
+        "to": "integrations"
+      },
+      {
+        "from": "comet-entry",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "comet-entry",
+        "to": "skill"
+      },
+      {
+        "from": "comet-entry",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "comet-memory",
+        "to": "agent-learning"
+      },
+      {
+        "from": "comet-memory",
+        "to": "comet-plugin"
+      },
+      {
+        "from": "comet-memory",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "comet-native",
+        "to": "engine"
+      },
+      {
+        "from": "comet-native",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "comet-native",
+        "to": "skill"
+      },
+      {
+        "from": "comet-native",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "comet-plugin",
+        "to": "agent-learning"
+      },
+      {
+        "from": "comet-plugin",
+        "to": "comet-memory"
+      },
+      {
+        "from": "comet-plugin",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "comet-plugin",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "dashboard",
+        "to": "comet-native"
+      },
+      {
+        "from": "dashboard",
+        "to": "comet-plugin"
+      },
+      {
+        "from": "dashboard",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "dashboard",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "engine",
+        "to": "skill"
+      },
+      {
+        "from": "engine",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "eval",
+        "to": "agent-learning"
+      },
+      {
+        "from": "eval",
+        "to": "comet-memory"
+      },
+      {
+        "from": "eval",
+        "to": "comet-plugin"
+      },
+      {
+        "from": "eval",
+        "to": "project-knowledge"
+      },
+      {
+        "from": "factory",
+        "to": "bundle"
+      },
+      {
+        "from": "factory",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "integrations",
+        "to": "skill"
+      },
+      {
+        "from": "integrations",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "project-knowledge",
+        "to": "agent-learning"
+      },
+      {
+        "from": "project-knowledge",
+        "to": "comet-memory"
+      },
+      {
+        "from": "project-knowledge",
+        "to": "comet-plugin"
+      },
+      {
+        "from": "project-knowledge",
+        "to": "workflow-contract"
+      },
+      {
+        "from": "skill",
+        "to": "comet-classic"
+      },
+      {
+        "from": "skill",
+        "to": "comet-entry"
+      },
+      {
+        "from": "skill",
+        "to": "comet-native"
+      },
+      {
+        "from": "skill",
+        "to": "integrations"
+      },
+      {
+        "from": "skill",
+        "to": "workflow-contract"
+      }
+    ],
+    "crossDomainEntrypoints": [
+      "domains/agent-learning/index.ts",
+      "domains/bundle/types.ts",
+      "domains/comet-classic/classic-command-checks.ts",
+      "domains/comet-classic/classic-current-change.ts",
+      "domains/comet-classic/classic-diagnostics.ts",
+      "domains/comet-classic/classic-hook-guard.ts",
+      "domains/comet-classic/classic-layout-initialization.ts",
+      "domains/comet-classic/classic-layout.ts",
+      "domains/comet-classic/classic-openspec-root.ts",
+      "domains/comet-classic/classic-paths.ts",
+      "domains/comet-classic/classic-protected-path.ts",
+      "domains/comet-classic/classic-resume-probe.ts",
+      "domains/comet-classic/classic-store.ts",
+      "domains/comet-entry/types.ts",
+      "domains/comet-memory/index.ts",
+      "domains/comet-memory/types.ts",
+      "domains/comet-native/native-bounded-file.ts",
+      "domains/comet-native/native-change.ts",
+      "domains/comet-native/native-children.ts",
+      "domains/comet-native/native-config.ts",
+      "domains/comet-native/native-diagnostics.ts",
+      "domains/comet-native/native-hook-guard.ts",
+      "domains/comet-native/native-local-execution.ts",
+      "domains/comet-native/native-paths.ts",
+      "domains/comet-native/native-portable-runtime.ts",
+      "domains/comet-native/native-portable-state.ts",
+      "domains/comet-native/native-portable-status.ts",
+      "domains/comet-native/native-portable-types.ts",
+      "domains/comet-native/native-selection.ts",
+      "domains/comet-native/native-specs.ts",
+      "domains/comet-native/native-types.ts",
+      "domains/comet-native/native-workspace.ts",
+      "domains/comet-plugin/index.ts",
+      "domains/engine/loop.ts",
+      "domains/engine/protected-run-file.ts",
+      "domains/engine/resolver.ts",
+      "domains/engine/run-store.ts",
+      "domains/engine/state.ts",
+      "domains/engine/storage-layout.ts",
+      "domains/engine/storage-run.ts",
+      "domains/engine/types.ts",
+      "domains/factory/package.ts",
+      "domains/integrations/openspec.ts",
+      "domains/integrations/superpowers.ts",
+      "domains/project-knowledge/capability-discovery.ts",
+      "domains/project-knowledge/host-review.ts",
+      "domains/project-knowledge/index.ts",
+      "domains/project-knowledge/learning.ts",
+      "domains/project-knowledge/remote-provider.ts",
+      "domains/project-knowledge/types.ts",
+      "domains/skill/dsh-adapter.ts",
+      "domains/skill/find.ts",
+      "domains/skill/inventory.ts",
+      "domains/skill/load.ts",
+      "domains/skill/platform-install.ts",
+      "domains/skill/preferences.ts",
+      "domains/skill/project-hook-projection.ts",
+      "domains/skill/snapshot.ts",
+      "domains/skill/types.ts",
+      "domains/skill/validate.ts",
+      "domains/workflow-contract/builtins.ts",
+      "domains/workflow-contract/contained-atomic-write.ts",
+      "domains/workflow-contract/current-selection.ts",
+      "domains/workflow-contract/global-config.ts",
+      "domains/workflow-contract/hook-target-scope.ts",
+      "domains/workflow-contract/hook-write-policy.ts",
+      "domains/workflow-contract/hook.ts",
+      "domains/workflow-contract/index.ts",
+      "domains/workflow-contract/neutral-document-path.ts",
+      "domains/workflow-contract/output-envelope.ts",
+      "domains/workflow-contract/project-config-reader.ts",
+      "domains/workflow-contract/project-config-writer.ts",
+      "domains/workflow-contract/project-config.ts",
+      "domains/workflow-contract/project-gitignore.ts",
+      "domains/workflow-contract/protected-project-path.ts",
+      "domains/workflow-contract/types.ts"
+    ],
+    "restrictedDependencies": [
+      {
+        "target": "domains/comet-native/native-mutation-lock.ts",
+        "importers": [
+          "domains/comet-native/index.ts",
+          "domains/comet-native/native-archive.ts",
+          "domains/comet-native/native-change.ts",
+          "domains/comet-native/native-check.ts",
+          "domains/comet-native/native-checkpoint-journal.ts",
+          "domains/comet-native/native-doctor-command.ts",
+          "domains/comet-native/native-evidence-retention.ts",
+          "domains/comet-native/native-portable-archive.ts",
+          "domains/comet-native/native-portable-checks.ts",
+          "domains/comet-native/native-portable-coordination.ts",
+          "domains/comet-native/native-portable-migration-runtime.ts",
+          "domains/comet-native/native-portable-recovery.ts",
+          "domains/comet-native/native-portable-requirements.ts",
+          "domains/comet-native/native-portable-shape-coordination.ts",
+          "domains/comet-native/native-portable-verification.ts",
+          "domains/comet-native/native-portable-verifier-coordination.ts",
+          "domains/comet-native/native-progress-checkpoint.ts",
+          "domains/comet-native/native-runner-input.ts",
+          "domains/comet-native/native-schema-migration.ts",
+          "domains/comet-native/native-selection.ts",
+          "domains/comet-native/native-specs.ts",
+          "domains/comet-native/native-supervisor-coordinator.ts",
+          "domains/comet-native/native-supervisor-evidence.ts",
+          "domains/comet-native/native-supervisor-workspace.ts",
+          "domains/comet-native/native-trajectory-recovery.ts",
+          "domains/comet-native/native-transition-journal.ts",
+          "domains/comet-native/native-transitions.ts",
+          "domains/comet-native/native-verification-receipt-runtime.ts",
+          "domains/comet-native/native-workspace.ts"
+        ],
+        "reason": "Only reviewed Native mutation entrypoints may acquire or re-export the project mutation lock."
+      }
+    ]
+  },
+  "appModules": ["cli", "commands"],
+  "domainModules": [
+    "agent-learning",
+    "bundle",
+    "comet-classic",
+    "comet-entry",
+    "comet-memory",
+    "comet-native",
+    "comet-plugin",
+    "dashboard",
+    "engine",
+    "eval",
+    "factory",
+    "integrations",
+    "project-knowledge",
+    "skill",
+    "workflow-contract"
+  ],
+  "platformModules": ["fs", "http", "install", "paths", "process", "version"],
+  "scriptModules": ["benchmark", "build", "install", "lib", "lint", "release"],
+  "allowedCodeFiles": ["bin/comet-daemon-router.js", "bin/fast-runtime-router.js"],
+  "testRoots": ["test"]
+}

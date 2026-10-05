@@ -1,0 +1,145 @@
+import { nativeArchiveCommand } from './native-archive-command.js';
+import { nativeCheckCommand } from './native-check-command.js';
+import { nativeDoctorCommand } from './native-doctor-command.js';
+import { nativeHookGuardCommand } from './native-hook-guard-command.js';
+import { nativeInitCommand } from './native-init-command.js';
+import { nativeNewCommand } from './native-new-command.js';
+import { nativeNextCommand } from './native-next-command.js';
+import { nativeRootCommand } from './native-root-command.js';
+import { nativeSelectCommand } from './native-select-command.js';
+import { nativeShowCommand } from './native-show-command.js';
+import { nativeSpecCommand } from './native-spec-command.js';
+import { nativeStatusCommand } from './native-status-command.js';
+import { nativeHelp } from './native-cli-help.js';
+import {
+  errorResult,
+  isNativeReadOnlyCommand,
+  NativeUsageError,
+  projectRootFrom,
+  renderNativeCommandDetailed,
+  takeFlag,
+  takeOption,
+  type DispatchResult,
+  type NativeCommandResult,
+} from './native-cli-shared.js';
+import {
+  projectNativeExperienceEvidence,
+  type NativeExperienceEvidence,
+} from './native-experience.js';
+
+export type { NativeCommandResult } from './native-cli-shared.js';
+
+export interface NativeCliDetailedResult {
+  dispatch: DispatchResult;
+  output: NativeCommandResult;
+  experience: NativeExperienceEvidence;
+  json: boolean;
+  verbose: boolean;
+}
+
+export interface NativeCliRunOptions {
+  invocationCwd?: string;
+}
+
+type NativeCommandHandler = (args: string[], projectRoot: string) => Promise<DispatchResult>;
+
+const COMMAND_HANDLERS: Record<string, NativeCommandHandler> = {
+  'hook-guard': nativeHookGuardCommand,
+  init: nativeInitCommand,
+  root: nativeRootCommand,
+  new: nativeNewCommand,
+  spec: nativeSpecCommand,
+  show: nativeShowCommand,
+  status: nativeStatusCommand,
+  select: nativeSelectCommand,
+  next: nativeNextCommand,
+  archive: nativeArchiveCommand,
+  check: nativeCheckCommand,
+  doctor: nativeDoctorCommand,
+};
+
+async function dispatch(
+  rawArgs: string[],
+  explicitProjectRoot: string | undefined,
+  invocationCwd: string,
+): Promise<DispatchResult> {
+  const helpIndex = rawArgs.indexOf('--help');
+  if (rawArgs.length === 0 || helpIndex >= 0 || rawArgs[0] === 'help') {
+    const topicParts =
+      rawArgs[0] === 'help' ? rawArgs.slice(1) : helpIndex >= 0 ? rawArgs.slice(0, helpIndex) : [];
+    let help: ReturnType<typeof nativeHelp>;
+    try {
+      help = nativeHelp(topicParts);
+    } catch (error) {
+      throw new NativeUsageError((error as Error).message);
+    }
+    return {
+      command: help.topic ? `${help.topic} --help` : 'help',
+      exitCode: 0,
+      data: help,
+      text: help.usage,
+    };
+  }
+  const command = rawArgs.shift()!;
+  const projectRoot = await projectRootFrom(explicitProjectRoot, invocationCwd);
+  const handler = COMMAND_HANDLERS[command];
+  if (!handler) {
+    throw new NativeUsageError(`Unknown Native command: ${command}`);
+  }
+  return { executionCwd: projectRoot, ...(await handler(rawArgs, projectRoot)) };
+}
+
+export async function runNativeCliDetailed(
+  argv: readonly string[],
+  options: NativeCliRunOptions = {},
+): Promise<NativeCliDetailedResult> {
+  const args = [...argv];
+  const separator = args.indexOf('--');
+  const globalArgs = separator < 0 ? args : args.slice(0, separator);
+  const commandTail = separator < 0 ? [] : args.slice(separator);
+  const json = globalArgs.includes('--json');
+  const verbose = globalArgs.includes('--verbose');
+  let explicitProjectRoot: string | undefined;
+  let command: string | null = globalArgs[0] ?? null;
+  try {
+    takeFlag(globalArgs, '--json');
+    takeFlag(globalArgs, '--verbose');
+    explicitProjectRoot = takeOption(globalArgs, '--project-root');
+    const dispatchArgs = [...globalArgs, ...commandTail];
+    command = dispatchArgs[0] ?? null;
+    const invoke = () =>
+      dispatch(dispatchArgs, explicitProjectRoot, options.invocationCwd ?? process.cwd());
+    const dispatchResult = isNativeReadOnlyCommand(command ?? '', dispatchArgs.slice(1))
+      ? await withGitWorktreeReadScope(invoke)
+      : await invoke();
+    const rendered = renderNativeCommandDetailed(dispatchResult, json, verbose);
+    return {
+      dispatch: dispatchResult,
+      output: rendered.output,
+      experience: projectNativeExperienceEvidence(
+        dispatchResult.data,
+        rendered.structuredDataVisible,
+      ),
+      json,
+      verbose,
+    };
+  } catch (error) {
+    const dispatchResult = errorResult(command, error);
+    const rendered = renderNativeCommandDetailed(dispatchResult, json, verbose);
+    return {
+      dispatch: dispatchResult,
+      output: rendered.output,
+      experience: projectNativeExperienceEvidence(
+        dispatchResult.data,
+        rendered.structuredDataVisible,
+      ),
+      json,
+      verbose,
+    };
+  }
+}
+
+export async function runNativeCli(argv: readonly string[]): Promise<NativeCommandResult> {
+  return (await runNativeCliDetailed(argv)).output;
+}
+import { withGitWorktreeReadScope } from '../../platform/paths/git-worktree.js';
