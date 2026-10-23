@@ -80,6 +80,77 @@ function descriptor(
 }
 
 describe('PluginRuntime', () => {
+  it('settles unobserved events without growing the learning backlog and retains events for failed modules', async () => {
+    const journal = new AgentExperienceJournal(new MemoryAgentExperienceJournalStore());
+    const runtime = new PluginRuntime({
+      cometVersion: '1.0.0',
+      store: new MemoryPluginStateStore(),
+      journal,
+      descriptors: [
+        descriptor('memory', 'first-party', {
+          create: () => ({ events: ['context.outcome'], provideContext: () => null }),
+        }),
+      ],
+    });
+    await runtime.reconcileFirstParty();
+    await runtime.collectContext({ task: 'Read context' }, 'user');
+    await runtime.enqueueEvents([experience('context.applied')], { finalizeUnobserved: true });
+    expect(await journal.status()).toMatchObject({ pending: 0 });
+    expect(await journal.list()).toHaveLength(1);
+
+    const brokenJournal = new AgentExperienceJournal(new MemoryAgentExperienceJournalStore());
+    const broken = new PluginRuntime({
+      cometVersion: '1.0.0',
+      store: new MemoryPluginStateStore(),
+      journal: brokenJournal,
+      descriptors: [
+        descriptor('broken', 'first-party', {
+          create: () => {
+            throw new Error('temporarily unavailable');
+          },
+        }),
+      ],
+    });
+    await broken.reconcileFirstParty();
+    await broken.collectContext({ task: 'Read context' }, 'user');
+    await broken.enqueueEvents([experience('context.applied')], { finalizeUnobserved: true });
+    expect(await brokenJournal.status()).toMatchObject({ pending: 1 });
+  });
+  it('keeps retry backoff during ordinary replay and clears it only on explicit retry', async () => {
+    const store = new MemoryAgentExperienceJournalStore();
+    const journal = new AgentExperienceJournal(store);
+    const reflect = vi.fn(() => {
+      throw new Error('temporary reflection failure');
+    });
+    const runtime = new PluginRuntime({
+      cometVersion: '1.0.0',
+      store: new MemoryPluginStateStore(),
+      descriptors: [
+        descriptor('memory', 'first-party', {
+          create: () => ({ events: ['episode.completed'], onEvent: reflect }),
+        }),
+      ],
+      journal,
+      scheduleLearning: async (task) => task(),
+    });
+    await runtime.reconcileFirstParty();
+    const event = experience('episode.completed');
+    await runtime.dispatch(event);
+    await runtime.replayLearning();
+    const before = (await store.read()).reflections[event.eventId];
+    expect(before).toMatchObject({
+      status: 'pending',
+      attempts: 2,
+      nextRetryAt: expect.any(String),
+    });
+    await runtime.replayLearning();
+    await runtime.replayLearning();
+    expect((await store.read()).reflections[event.eventId]).toEqual(before);
+    expect(reflect).toHaveBeenCalledTimes(2);
+    await runtime.replayLearning({ retryNow: true });
+    expect(reflect).toHaveBeenCalledTimes(3);
+  });
+
   it.each(['enable', 'disable'] as const)(
     'does not undo an uninstall committed before %s acquires its lock',
     async (action) => {
@@ -222,6 +293,7 @@ describe('PluginRuntime', () => {
       store: new MemoryPluginStateStore(),
       descriptors: [learner],
       journals: { user: userJournal, project: projectAJournal },
+      scheduleLearning: (task) => task(),
     });
     await runtimeA.reconcileFirstParty();
     const event = experience('episode.completed', { changeId: 'shared-user-event' });
@@ -239,7 +311,9 @@ describe('PluginRuntime', () => {
       journals: { user: userJournal, project: projectBJournal },
     });
     await runtimeB.reconcileFirstParty();
-    await runtimeB.collectContext({ task: 'resume user learning' }, 'user');
+    await runtimeB.collectContext({ task: 'read user context' }, 'user');
+    expect(received).toEqual([]);
+    await runtimeB.replayLearning();
 
     await vi.waitFor(() => expect(received).toEqual([event.eventId]));
     await vi.waitFor(async () => expect(await userJournal.pending()).toEqual([]));
@@ -480,9 +554,18 @@ describe('PluginRuntime', () => {
     });
     await runtime.reconcileFirstParty();
 
-    await expect(runtime.collectContext({ task: 'build' }, 'user')).resolves.toEqual([
-      expect.objectContaining({ owner: 'healthy', summary: 'ok' }),
-    ]);
+    const samples: { owner: string; status: string }[] = [];
+    await expect(
+      runtime.collectContext({ task: 'build' }, 'user', (sample) => samples.push(sample)),
+    ).resolves.toEqual([expect.objectContaining({ owner: 'healthy', summary: 'ok' })]);
+    expect(samples).toEqual(
+      expect.arrayContaining([expect.objectContaining({ owner: 'broken', status: 'error' })]),
+    );
+    await expect(
+      runtime.collectContext({ task: 'build' }, 'user', () => {
+        throw new Error('telemetry failure');
+      }),
+    ).resolves.toEqual([expect.objectContaining({ owner: 'healthy' })]);
     await expect(runtime.dashboardPages('user')).resolves.toEqual([
       { pluginId: 'healthy', id: 'healthy-page', label: 'Healthy', route: '/healthy' },
     ]);

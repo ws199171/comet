@@ -1,3 +1,4 @@
+import { resolveWorkspaceRuntimeRootSync } from '../../../domains/workflow-contract/workspace-runtime.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -60,11 +61,11 @@ describe('packaged Runtime issue regressions', () => {
       ],
       { cwd: root, stdio: 'ignore' },
     );
-    expect(invoke(['new', name]).exitCode).toBe(0);
+    expect(invoke(['new', name, '--runtime', 'compat']).exitCode).toBe(0);
     const change = path.join(root, 'docs/comet/changes', name);
     await fs.writeFile(
       path.join(change, 'brief.md'),
-      '# Outcome\nShip both fixture behaviors.\n# Scope\nBoth fixture behaviors.\n# Non-goals\nNo unrelated work.\n# Acceptance examples\n- First behavior works.\n- Second behavior works.\n# Constraints and invariants\nKeep scope fixed.\n# Decisions\nUse fixture implementation.\n# Open questions\nNone.\n# Verification expectations\nRun applicable checks.\n',
+      '# Outcome\nShip both fixture behaviors.\n# Scope\nBoth fixture behaviors.\n## Directory structure\n### Created\nNone.\n### Modified\nNone.\n### Deleted\nNone.\n### Not created\nNone.\n# Non-goals\nNo unrelated work.\n# Acceptance examples\n- First behavior works.\n- Second behavior works.\n# Constraints and invariants\nKeep scope fixed.\n# Decisions\nUse fixture implementation.\n# Open questions\nNone.\n# Verification expectations\nRun applicable checks.\n',
     );
     await fs.mkdir(path.join(change, 'specs/fixture'), { recursive: true });
     await fs.writeFile(
@@ -100,7 +101,7 @@ describe('packaged Runtime issue regressions', () => {
     ).toBe(65);
     expect(invoke(['show', name]).data.state).toEqual(before);
     const rejectedInput = path.join(root, `input-${sequence}.json`);
-    const counter = path.join(root, '.comet/runtime/count.txt');
+    const counter = path.join(resolveWorkspaceRuntimeRootSync(root), 'count.txt');
     const plan = {
       id: 'fixture',
       name: 'Fixture',
@@ -188,7 +189,7 @@ describe('packaged Runtime issue regressions', () => {
           { id: 'A2', result: 'passed' },
         ],
       });
-      function hook(event: unknown) {
+      function hook(event: unknown, expectedStatus = 0) {
         const result = spawnSync(
           process.execPath,
           [router, '--platform', 'oh-my-pi', '--project-root', root],
@@ -200,25 +201,32 @@ describe('packaged Runtime issue regressions', () => {
             windowsHide: true,
           },
         );
-        expect(result.status, result.stderr).toBe(0);
+        expect(result.status, result.stderr).toBe(expectedStatus);
       }
       hook({
         tool_input: { targets: ['agent:/Main', 'proc:/verify-server/kill', 'xd:/report_issue'] },
       });
       hook({ tool_name: 'write', tool_input: { path: 'agent:/Main' } });
       expect(invoke(['show', name]).data.state).toEqual(before);
-      hook({
-        tool_name: 'write',
-        tool_input: { targets: ['file://%broken', 'agent:/Main', 'src/new-file.ts'] },
-      });
-      expect(invoke(['show', name]).data.state).toMatchObject({
-        phase: 'build',
-        verification_result: 'pending',
-        acceptance: [
-          { id: 'A1', result: 'pending' },
-          { id: 'A2', result: 'pending' },
-        ],
-      });
+      hook(
+        {
+          tool_name: 'write',
+          tool_input: { targets: ['file://%broken', 'agent:/Main', 'src/new-file.ts'] },
+        },
+        phase === 'verify' ? 2 : 0,
+      );
+      expect(invoke(['show', name]).data.state).toMatchObject(
+        phase === 'verify'
+          ? { phase: 'verify' }
+          : {
+              phase: 'build',
+              verification_result: 'pending',
+              acceptance: [
+                { id: 'A1', result: 'pending' },
+                { id: 'A2', result: 'pending' },
+              ],
+            },
+      );
     },
   );
 });

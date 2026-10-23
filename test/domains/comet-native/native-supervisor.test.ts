@@ -74,6 +74,16 @@ Exercise one integrated Supervisor result.
 # Scope
 Coordinate the child changes and the parent verification boundary.
 
+## Directory structure
+### Created
+None.
+### Modified
+None.
+### Deleted
+None.
+### Not created
+None.
+
 # Non-goals
 Do not introduce behavior outside the coordinated change.
 
@@ -295,6 +305,12 @@ describe('Native Supervisor v2 state', () => {
       });
       expect(requested.continuation.action).toBe('await-verifier');
 
+      expect(
+        execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+          cwd: integrationRoot,
+          encoding: 'utf8',
+        }),
+      ).toBe('');
       const verifiedParent = await applyNativeRunnerInput({
         paths,
         name: 'parent',
@@ -2043,6 +2059,12 @@ children:
           ],
         },
       });
+      expect(
+        execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+          cwd: supervisor.integration.worktree,
+          encoding: 'utf8',
+        }),
+      ).toBe('');
       const failed = await applyNativeRunnerInput({
         paths,
         name: 'parent',

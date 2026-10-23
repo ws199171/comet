@@ -1,11 +1,25 @@
+import { resolveClassicStateFile, CLASSIC_STATE_FILES } from './classic-state-file.js';
+import { CLASSIC_LOCAL_RECORDS, selectClassicLocalReadTarget } from './classic-runtime-paths.js';
+import {
+  migrateWorkspaceRuntimePath,
+  isWorkspaceRuntimeMigrationFence,
+  resolveWorkspaceRuntimeRoot,
+  resolveWorkspaceRuntimeRootSync,
+} from '../workflow-contract/workspace-runtime.js';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
 import { parseDocument } from 'yaml';
+import {
+  hashProtectedProjectFile,
+  readProtectedProjectFile,
+} from '../workflow-contract/protected-project-path.js';
 import {
   ExternalCommandError,
   runExternalCommand,
 } from '../../platform/process/external-command.js';
 import { nonInteractiveGitEnvironment } from '../../platform/process/git-environment.js';
+import { memoizedHookRead, memoizedHookReadSync } from '../../platform/process/hook-read-cache.js';
 import { classicTaskRevision, parseClassicTasks } from './classic-tasks.js';
 import type { ClassicState } from './classic-state.js';
 import {
@@ -30,8 +44,8 @@ export interface ClassicCheckpoint {
 }
 
 export interface ClassicDeliveryInput {
-  action: 'local' | 'push' | 'pr';
-  targetBranch: string;
+  action: 'local' | 'push' | 'pr' | 'archive-only';
+  targetBranch?: string;
   remote?: string;
   commit?: string;
   prUrl?: string;
@@ -129,7 +143,7 @@ async function readRecord(root: string, changeDir: string, filename: string): Pr
 
 function deliveryReauthorizationFile(root: string, changeIdentity: string): string {
   const key = createHash('sha256').update(changeIdentity).digest('hex');
-  return path.join(root, '.comet', 'runtime', 'classic-delivery', `${key}.json`);
+  return path.join(resolveWorkspaceRuntimeRootSync(root), 'classic-delivery', `${key}.json`);
 }
 
 interface ClassicDeliveryReauthorization {
@@ -181,6 +195,8 @@ async function readClassicDeliveryReauthorization(
     },
     true,
   );
+  if (input.action === 'archive-only')
+    throw new Error('Classic archive-only delivery cannot be reauthorized');
   if (input.commit !== undefined || input.prUrl !== undefined) {
     throw new Error('Classic delivery reauthorization cannot change sealed commit or PR evidence');
   }
@@ -190,6 +206,7 @@ async function readClassicDeliveryReauthorization(
     previousAuthorizationId: text(value.previousAuthorizationId, 'previousAuthorizationId'),
     authorizationId: text(value.authorizationId, 'authorizationId'),
     ...input,
+    targetBranch: input.targetBranch!,
     ...(value.authorizedRemoteUrl === undefined
       ? {}
       : { authorizedRemoteUrl: text(value.authorizedRemoteUrl, 'authorizedRemoteUrl') }),
@@ -286,10 +303,22 @@ function deliveryInput(input: unknown, persisted = false): ClassicDeliveryInput 
       ? ['schemaVersion', 'changeIdentity', 'authorizedRemoteUrl', 'authorizationId']
       : []),
   ]);
-  if (!['local', 'push', 'pr'].includes(value.action as string))
+  if (!['local', 'push', 'pr', 'archive-only'].includes(value.action as string))
     throw new Error(
-      `Invalid Classic delivery action '${String(value.action)}'; actions: local|push|pr`,
+      `Invalid Classic delivery action '${String(value.action)}'; actions: local|push|pr|archive-only`,
     );
+  if (value.action === 'archive-only') {
+    if (
+      value.targetBranch !== undefined ||
+      value.remote !== undefined ||
+      value.commit !== undefined ||
+      value.prUrl !== undefined
+    )
+      throw new Error(
+        'Classic archive-only delivery cannot claim a Git branch, remote, commit, or PR',
+      );
+    return { action: 'archive-only' };
+  }
   const targetBranch = text(value.targetBranch, 'targetBranch');
   if (
     targetBranch.startsWith('-') ||
@@ -330,26 +359,60 @@ function stateObject(source: string): Record<string, unknown> {
   return object(document.toJS());
 }
 
-function identity(state: Record<string, unknown>, changeDir: string): string {
+const readGitCommonDirectory = memoizedHookReadSync('classicGitCommonDirectory', (root: string) =>
+  verifyingGit(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+);
+
+function identity(state: Record<string, unknown>, changeDir: string, root: string): string {
   if (typeof state.run_id === 'string' && state.run_id) return `run:${state.run_id}`;
+  return legacyIdentity(state, changeDir, root);
+}
+
+function legacyIdentity(state: Record<string, unknown>, changeDir: string, root: string): string {
   // Legacy authorization is explicit, and survives the dated archive directory move.
   const name =
-    state.archived === true
+    state.archived === true || path.basename(path.dirname(changeDir)) === 'archive'
       ? path.basename(changeDir).replace(/^\d{4}-\d{2}-\d{2}-/u, '')
       : path.basename(changeDir);
-  if (typeof state.created_at !== 'string' || typeof state.base_ref !== 'string')
+  if (
+    typeof state.created_at !== 'string' ||
+    (typeof state.base_ref !== 'string' && state.base_ref !== null)
+  )
     throw new Error('Classic delivery requires stable change identity');
   return `legacy:${createHash('sha256')
-    .update(JSON.stringify([name, state.created_at, state.base_ref]))
+    .update(JSON.stringify([name, state.created_at, state.base_ref ?? path.resolve(root)]))
     .digest('hex')}`;
 }
 
-async function currentState(root: string, changeDir: string) {
+function authorizedIdentity(
+  sealed: unknown,
+  state: Record<string, unknown>,
+  changeDir: string,
+  root: string,
+): string {
+  const current = identity(state, changeDir, root);
+  if (sealed === current) return current;
+  if (typeof sealed === 'string' && sealed.startsWith('legacy:')) {
+    if (sealed === legacyIdentity(state, changeDir, root)) return sealed;
+  }
+  throw new Error('Classic delivery change identity mismatch');
+}
+
+const cachedCurrentState = memoizedHookRead(
+  'classicCurrentState',
+  async (root: string, changeDir: string) => currentStateUncached(root, changeDir),
+);
+
+async function currentStateUncached(root: string, changeDir: string) {
   return stateObject(
-    await readClassicProjectFile(root, path.join(changeDir, '.comet.yaml'), {
+    await readClassicProjectFile(root, await resolveClassicStateFile(changeDir), {
       label: 'Classic delivery state',
     }),
   );
+}
+
+async function currentState(root: string, changeDir: string) {
+  return cachedCurrentState(root, changeDir);
 }
 
 class GitCommandTimeoutError extends Error {
@@ -448,9 +511,11 @@ function archivePathspecs(root: string, changeDir: string): string[] {
   const relative = path.relative(root, changeDir).replaceAll('\\', '/');
   return [
     `:(literal)${relative}`,
-    ...['.comet-state.lock', '.comet-state-transaction.json'].map(
-      (file) => `:(exclude,literal)${relative}/${file}`,
-    ),
+    ...[
+      '.comet-state.lock',
+      '.comet-state-transaction.json',
+      ...[...CLASSIC_LOCAL_RECORDS].map((name) => `.comet/${name}`),
+    ].map((file) => `:(exclude,literal)${relative}/${file}`),
   ];
 }
 
@@ -473,13 +538,16 @@ function archiveCommitMatches(
 ): boolean {
   const relative = path.relative(root, changeDir).replaceAll('\\', '/');
   const archivePaths = archivePathspecs(root, changeDir);
-  const source = verifyingGit(root, ['show', `${commit}:${relative}/.comet.yaml`]);
-  if (!source) return false;
+  const sources = CLASSIC_STATE_FILES.map((name) =>
+    verifyingGit(root, ['show', `${commit}:${relative}/${name}`]),
+  ).filter((source): source is string => source !== null);
+  if (sources.length !== 1) return false;
+  const source = sources[0];
   try {
     const committed = stateObject(source);
     return (
       committed.archived === true &&
-      identity(committed, changeDir) === changeIdentity &&
+      authorizedIdentity(changeIdentity, committed, changeDir, root) === changeIdentity &&
       verifyingGit(root, ['merge-base', '--is-ancestor', commit, 'HEAD']) !== null &&
       verifyingGit(root, [
         'diff',
@@ -506,22 +574,207 @@ interface DeliveryReceipt {
   invalidated?: boolean;
   commit?: string;
   prUrl?: string;
+  archiveFiles?: Record<string, string>;
 }
 
-function receiptLocations(root: string, changeIdentity: string) {
+async function archiveFileManifest(
+  root: string,
+  changeDir: string,
+): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  const visit = async (directory: string): Promise<void> => {
+    await inspectClassicProjectTarget(root, directory, {
+      label: 'Classic document archive',
+      expected: 'directory',
+    });
+    const entries = (await fs.readdir(directory, { withFileTypes: true })).sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    );
+    for (const entry of entries) {
+      if (['.comet-state.lock', '.comet-state-transaction.json'].includes(entry.name)) continue;
+      if (directory === path.join(changeDir, '.comet') && CLASSIC_LOCAL_RECORDS.has(entry.name))
+        continue;
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(target);
+      } else if (entry.isFile()) {
+        const relative = path.relative(root, target).replaceAll('\\', '/');
+        const hashed = await hashProtectedProjectFile(root, relative, {
+          label: 'Classic document archive file',
+        });
+        files[relative] = hashed.digest;
+      } else {
+        throw new Error(`Classic document archive contains unsupported entry: ${target}`);
+      }
+      if (Object.keys(files).length > 10_000)
+        throw new Error('Classic document archive has too many files');
+    }
+  };
+  await visit(changeDir);
+  return files;
+}
+
+function archiveManifestsMatch(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const portable = (file: string) => {
+    const match = /\/\.comet\/([^/]+)/u.exec(file);
+    return !match || !CLASSIC_LOCAL_RECORDS.has(match[1]);
+  };
+  const names = Object.keys(left).filter(portable);
+  return (
+    names.length === Object.keys(right).filter(portable).length &&
+    names.every((name) => left[name] === right[name])
+  );
+}
+
+async function preserveMainSpecSnapshot(root: string, changeDir: string): Promise<void> {
+  const snapshot = path.join(changeDir, '.comet', 'main-specs.json');
+  if (
+    await classicProjectTargetExists(root, snapshot, {
+      label: 'Classic main spec snapshot',
+      expected: 'file',
+    })
+  )
+    return;
+  const specsDir = path.join(path.dirname(path.dirname(path.dirname(changeDir))), 'specs');
+  const files: Record<string, string> = {};
+  let totalBytes = 0;
+  const visit = async (directory: string): Promise<void> => {
+    await inspectClassicProjectTarget(root, directory, {
+      label: 'Classic main specs',
+      expected: 'directory',
+    });
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(target);
+      else if (entry.isFile()) {
+        const file = await readProtectedProjectFile(
+          root,
+          path.relative(root, target).replaceAll('\\', '/'),
+          64 * 1024 * 1024,
+          { label: 'Classic main spec snapshot input' },
+        );
+        totalBytes += file.bytes.length;
+        if (totalBytes > 64 * 1024 * 1024 || Object.keys(files).length >= 10_000)
+          throw new Error('Classic main spec snapshot exceeds its size limit');
+        files[path.relative(specsDir, target).replaceAll('\\', '/')] =
+          file.bytes.toString('base64');
+      } else throw new Error(`Classic main specs contain unsupported entry: ${target}`);
+    }
+  };
+  if (
+    await classicProjectTargetExists(root, specsDir, {
+      label: 'Classic main specs',
+      expected: 'directory',
+    })
+  )
+    await visit(specsDir);
+  await ensureClassicProjectDirectory(
+    root,
+    path.dirname(snapshot),
+    'Classic main spec snapshot directory',
+  );
+  await writeClassicProjectText(
+    root,
+    snapshot,
+    JSON.stringify({ schemaVersion: 1, files }) + '\n',
+    { label: 'Classic main spec snapshot', exclusive: true },
+  );
+}
+
+export async function recordClassicDocumentArchive(root: string, changeDir: string): Promise<void> {
+  const current = await readClassicDelivery(root, changeDir);
+  const delivery = current.delivery;
+  if (delivery?.action !== 'archive-only') return;
+  const actual = await currentState(root, changeDir);
+  if (actual.archived !== true) throw new Error('Classic document archive must be completed first');
+  await preserveMainSpecSnapshot(root, changeDir);
+  const archiveFiles = await archiveFileManifest(root, changeDir);
+  const previous = await readReceipt(root, delivery.changeIdentity);
+  if (previous?.archiveFiles !== undefined) {
+    if (!archiveManifestsMatch(previous.archiveFiles, archiveFiles))
+      throw new Error('Classic document archive differs from its sealed receipt');
+    return;
+  }
+  await writeReceipt(root, {
+    schemaVersion: 1,
+    changeIdentity: delivery.changeIdentity,
+    authorizationId: delivery.authorizationId,
+    archiveFiles,
+  });
+}
+
+async function receiptLocations(
+  root: string,
+  changeIdentity: string,
+  options: { migrate?: boolean } = {},
+) {
   const filename = `${createHash('sha256').update(changeIdentity).digest('hex')}.json`;
+  const runtime = options.migrate
+    ? await resolveWorkspaceRuntimeRoot(root)
+    : resolveWorkspaceRuntimeRootSync(root);
+  const file = path.join(runtime, 'classic-delivery-receipts', filename);
+  if (!options.migrate) {
+    const locations = new Map<string, { root: string; file: string }>();
+    const local = await selectClassicLocalReadTarget(
+      root,
+      path.join(root, '.comet', 'classic-deliveries', filename),
+      file,
+    );
+    locations.set(local.target, { root, file: local.target });
+    const common = readGitCommonDirectory(root);
+    if (common) {
+      const sourceRoot = await fs.realpath(common);
+      const source = path.join(sourceRoot, 'comet', 'classic-deliveries', filename);
+      const selected = await selectClassicLocalReadTarget(root, source, file, '', sourceRoot);
+      locations.set(selected.target, {
+        root: selected.target === source ? sourceRoot : root,
+        file: selected.target,
+      });
+    }
+    return [...locations.values()];
+  }
+  await migrateWorkspaceRuntimePath(
+    path.join(root, '.comet', 'classic-deliveries', filename),
+    file,
+    { projectRoot: root },
+  );
   const common = verifyingGit(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  return [
-    { root, file: path.join(root, '.comet', 'classic-deliveries', filename) },
-    ...(common
-      ? [{ root: common, file: path.join(common, 'comet', 'classic-deliveries', filename) }]
-      : []),
-  ];
+  const legacy = common ? path.join(common, 'comet', 'classic-deliveries', filename) : null;
+  if (legacy) {
+    const sourceRoot = await fs.realpath(common!);
+    const source = path.join(sourceRoot, 'comet', 'classic-deliveries', filename);
+    const exists = await classicProjectTargetExists(sourceRoot, source, {
+      label: 'Legacy Classic delivery receipt',
+      expected: 'any',
+    });
+    if (exists && !(await isWorkspaceRuntimeMigrationFence(source))) {
+      const receipt = JSON.parse(
+        await readClassicProjectFile(sourceRoot, source, {
+          label: 'Legacy Classic delivery receipt',
+        }),
+      );
+      if (
+        receipt?.schemaVersion !== 1 ||
+        receipt.changeIdentity !== changeIdentity ||
+        typeof receipt.authorizationId !== 'string'
+      )
+        throw new Error('Legacy Classic delivery receipt does not belong to this change');
+    }
+    await migrateWorkspaceRuntimePath(source, file, {
+      projectRoot: root,
+      sourceRoot,
+      ignoreForeignWorkspaceFence: true,
+    });
+  }
+  return [{ root, file }];
 }
 
 async function readReceipt(root: string, changeIdentity: string): Promise<DeliveryReceipt | null> {
   let receipt: DeliveryReceipt | null = null;
-  for (const location of receiptLocations(root, changeIdentity)) {
+  for (const location of await receiptLocations(root, changeIdentity)) {
     if (
       !(await classicProjectTargetExists(location.root, location.file, {
         label: 'Classic delivery receipt',
@@ -543,6 +796,7 @@ async function readReceipt(root: string, changeIdentity: string): Promise<Delive
       'invalidated',
       'commit',
       'prUrl',
+      'archiveFiles',
     ]);
     if (value.schemaVersion !== 1 || value.changeIdentity !== changeIdentity)
       throw new Error('Invalid Classic delivery receipt schema or identity');
@@ -561,12 +815,37 @@ async function readReceipt(root: string, changeIdentity: string): Promise<Delive
       ...(value.invalidated === true ? { invalidated: true } : {}),
       ...(evidence.commit ? { commit: evidence.commit } : {}),
       ...(evidence.prUrl ? { prUrl: evidence.prUrl } : {}),
+      ...(value.archiveFiles === undefined
+        ? {}
+        : {
+            archiveFiles: validateArchiveFiles(value.archiveFiles),
+          }),
     };
     if (receipt && JSON.stringify(receipt) !== JSON.stringify(next))
       throw new Error('Conflicting Classic delivery receipts');
     receipt = next;
   }
   return receipt;
+}
+
+function validateArchiveFiles(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('Invalid Classic document archive receipt');
+  const files = value as Record<string, unknown>;
+  if (
+    Object.keys(files).length === 0 ||
+    Object.keys(files).length > 10_000 ||
+    Object.entries(files).some(
+      ([file, digest]) =>
+        file.startsWith('/') ||
+        file.includes('\\') ||
+        file.split('/').some((part) => !part || part === '.' || part === '..') ||
+        typeof digest !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(digest),
+    )
+  )
+    throw new Error('Invalid Classic document archive receipt');
+  return files as Record<string, string>;
 }
 
 function authorizationId(value: Record<string, unknown>): string {
@@ -583,9 +862,12 @@ export async function invalidateClassicDelivery(root: string, changeDir: string)
   const value = object(raw);
   if (value.schemaVersion !== 1) throw new Error('Unsupported Classic delivery schemaVersion');
   deliveryInput(value, true);
-  const changeIdentity = identity(await currentState(root, changeDir), changeDir);
-  if (value.changeIdentity !== changeIdentity)
-    throw new Error('Classic delivery change identity mismatch');
+  const changeIdentity = authorizedIdentity(
+    value.changeIdentity,
+    await currentState(root, changeDir),
+    changeDir,
+    root,
+  );
   const previous = await readReceipt(root, changeIdentity);
   const id = authorizationId(value);
   if (previous?.authorizationId === id && previous.invalidated) return;
@@ -598,36 +880,15 @@ export async function invalidateClassicDelivery(root: string, changeDir: string)
 }
 
 async function writeReceipt(root: string, receipt: DeliveryReceipt): Promise<void> {
-  const locations = receiptLocations(root, receipt.changeIdentity);
-  const candidate = locations[0];
-  const relative = path.relative(root, candidate.file).replaceAll('\\', '/');
-  const ignored =
-    verifyingGit(root, ['check-ignore', '--quiet', '--', relative]) !== null &&
-    verifyingGit(root, ['ls-files', '--', `:(literal)${relative}`]) === '';
-  const location = ignored ? candidate : locations[1];
-  if (!location)
-    throw new Error('Classic delivery receipt requires ignored runtime storage or Git metadata');
-  if (
-    !ignored &&
-    (await classicProjectTargetExists(root, candidate.file, {
-      label: 'Classic delivery receipt',
-      expected: 'file',
-    }))
-  )
-    throw new Error(
-      'Classic delivery receipt became trackable; restore its runtime ignore rule before updating',
-    );
+  const [location] = await receiptLocations(root, receipt.changeIdentity, { migrate: true });
   await ensureClassicProjectDirectory(
-    location.root,
+    root,
     path.dirname(location.file),
     'Classic delivery receipt directory',
   );
-  await writeClassicProjectText(
-    location.root,
-    location.file,
-    JSON.stringify(receipt, null, 2) + '\n',
-    { label: 'Classic delivery receipt' },
-  );
+  await writeClassicProjectText(root, location.file, JSON.stringify(receipt, null, 2) + '\n', {
+    label: 'Classic delivery receipt',
+  });
 }
 
 function containsCommit(root: string, commit: string, head: string): boolean {
@@ -684,8 +945,9 @@ function verifiedPrUrl(value: string, repository: string): string | null {
 export async function readClassicDelivery(
   root: string,
   changeDir: string,
-  options: { verifyRemote?: boolean } = {},
+  options: { verifyRemote?: boolean; evidence?: boolean } = {},
 ) {
+  const evidence = options.evidence !== false;
   const raw = await readRecord(root, changeDir, 'delivery.json');
   if (raw === undefined)
     return { delivery: null, verification: { status: 'needsAuthorization' as const } };
@@ -693,9 +955,7 @@ export async function readClassicDelivery(
   if (value.schemaVersion !== 1) throw new Error('Unsupported Classic delivery schemaVersion');
   const input = deliveryInput(value, true);
   const state = await currentState(root, changeDir);
-  const changeIdentity = identity(state, changeDir);
-  if (value.changeIdentity !== changeIdentity)
-    throw new Error('Classic delivery change identity mismatch');
+  const changeIdentity = authorizedIdentity(value.changeIdentity, state, changeDir, root);
   const id = authorizationId(value);
   const reauthorization = await readClassicDeliveryReauthorization(root, changeIdentity);
   if (reauthorization && reauthorization.previousAuthorizationId !== id) {
@@ -738,6 +998,48 @@ export async function readClassicDelivery(
     authorizationId: effectiveId,
     ...(authorizedRemoteUrl ? { authorizedRemoteUrl } : {}),
   };
+  if (effectiveInput.action === 'archive-only') {
+    let archiveVerified = false;
+    if (state.archived === true && receipt?.archiveFiles !== undefined) {
+      const files = await archiveFileManifest(root, changeDir).catch((error: unknown) => {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+        throw error;
+      });
+      archiveVerified = files !== null && archiveManifestsMatch(receipt.archiveFiles, files);
+    }
+    return {
+      delivery,
+      verification: {
+        status: archiveVerified ? ('complete' as const) : ('needsVerification' as const),
+        archiveVerified,
+      },
+    };
+  }
+  // Probe callers only need to know whether delivery is still pending, so the
+  // sealed receipt alone decides: a receipt bound to this authorization with a
+  // recorded commit or PR is treated as delivered, everything else stays
+  // pending for the full git verification owned by verify/archive flows.
+  if (!evidence) {
+    return {
+      delivery,
+      verification: {
+        status:
+          receipt?.commit || receipt?.prUrl
+            ? ('complete' as const)
+            : ('needsVerification' as const),
+        currentBranch: null,
+        commitExists: false,
+        archiveCommitted: false,
+        observedCommit: null,
+        observedPrUrl: null,
+        remoteVerified: false,
+        prVerified: false,
+        remoteStatus: 'notChecked' as const,
+        prStatus: 'notChecked' as const,
+      },
+    };
+  }
   const currentBranch = localGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
   const relative = path.relative(root, changeDir).replaceAll('\\', '/');
   let observedCommit: string | null = null;
@@ -748,7 +1050,7 @@ export async function readClassicDelivery(
       '--format=%H',
       'HEAD',
       '--',
-      `:(literal)${relative}/.comet.yaml`,
+      ...CLASSIC_STATE_FILES.map((name) => `:(literal)${relative}/${name}`),
     ]);
     observedCommit =
       history
@@ -868,7 +1170,7 @@ export async function readClassicDelivery(
           '--repo',
           repository,
           '--head',
-          effectiveInput.targetBranch,
+          effectiveInput.targetBranch!,
           '--state',
           'all',
           '--json',
@@ -928,8 +1230,23 @@ export async function writeClassicDelivery(
   state: Pick<ClassicState, 'phase' | 'verifyResult' | 'archived'>,
 ) {
   const next = deliveryInput(input);
-  if (verifyingGit(root, ['check-ref-format', `refs/heads/${next.targetBranch}`]) === null)
+  if (
+    next.action !== 'archive-only' &&
+    verifyingGit(root, ['rev-parse', '--show-toplevel']) === null
+  )
+    throw new Error(
+      'Classic Git delivery requires a Git coordination root; use archive-only for local documents in a non-Git root',
+    );
+  if (
+    next.action !== 'archive-only' &&
+    verifyingGit(root, ['check-ref-format', `refs/heads/${next.targetBranch}`]) === null
+  )
     throw new Error('Invalid Classic delivery targetBranch');
+  if (
+    next.action === 'archive-only' &&
+    verifyingGit(root, ['rev-parse', '--show-toplevel']) !== null
+  )
+    throw new Error('Classic archive-only delivery requires a non-Git coordination root');
   const previous = (await readClassicDelivery(root, changeDir)).delivery;
   const actual = await currentState(root, changeDir);
   if (
@@ -946,6 +1263,7 @@ export async function writeClassicDelivery(
     );
   if (
     !previous &&
+    next.action !== 'archive-only' &&
     (verifyingGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']) !== next.targetBranch ||
       (actual.bound_branch && actual.bound_branch !== next.targetBranch))
   )
@@ -966,7 +1284,12 @@ export async function writeClassicDelivery(
   if (
     next.commit &&
     (actual.archived !== true ||
-      !archiveCommitMatches(root, changeDir, next.commit, identity(actual, changeDir)))
+      !archiveCommitMatches(
+        root,
+        changeDir,
+        next.commit,
+        previous?.changeIdentity ?? identity(actual, changeDir, root),
+      ))
   ) {
     const untracked = archiveUntrackedFiles(root, changeDir);
     throw new Error(
@@ -976,7 +1299,7 @@ export async function writeClassicDelivery(
     );
   }
   let authorizedRemoteUrl = previous?.authorizedRemoteUrl;
-  if (!previous && next.action !== 'local') {
+  if (!previous && next.action !== 'local' && next.action !== 'archive-only') {
     next.remote ??= 'origin';
     authorizedRemoteUrl = remoteUrl(root, next.remote) ?? undefined;
     if (!authorizedRemoteUrl || remoteUrl(root, next.remote, true) !== authorizedRemoteUrl)
@@ -992,7 +1315,7 @@ export async function writeClassicDelivery(
     ...previous,
     ...next,
     schemaVersion: 1,
-    changeIdentity: identity(actual, changeDir),
+    changeIdentity: previous?.changeIdentity ?? identity(actual, changeDir, root),
     authorizationId: previous?.authorizationId ?? randomUUID(),
     ...(authorizedRemoteUrl ? { authorizedRemoteUrl } : {}),
   };
@@ -1034,16 +1357,17 @@ export async function reauthorizeClassicDelivery(
   if (!state.archived || state.phase !== 'archive' || state.verifyResult !== 'pass') {
     throw new Error('Classic delivery reauthorization requires an archived verified change');
   }
-  const current = await currentState(root, changeDir);
-  const changeIdentity = identity(current, changeDir);
-  if (await readClassicDeliveryReauthorization(root, changeIdentity)) {
-    throw new Error('Classic delivery already has a reauthorization; use that authorization');
-  }
   if ((await readRecord(root, changeDir, 'delivery.json')) === undefined)
     throw new Error('Classic delivery authorization is missing');
   const previous = await readClassicDelivery(root, changeDir);
   if (!previous.delivery) throw new Error('Classic delivery authorization is unavailable');
+  const changeIdentity = previous.delivery.changeIdentity;
+  if (await readClassicDeliveryReauthorization(root, changeIdentity)) {
+    throw new Error('Classic delivery already has a reauthorization; use that authorization');
+  }
   const next = deliveryInput(input);
+  if (next.action === 'archive-only' || previous.delivery.action === 'archive-only')
+    throw new Error('Classic archive-only delivery cannot be reauthorized as Git delivery');
   if (next.commit !== undefined || next.prUrl !== undefined) {
     throw new Error('Classic delivery reauthorization cannot change sealed commit or PR evidence');
   }
@@ -1072,9 +1396,10 @@ export async function reauthorizeClassicDelivery(
     previousAuthorizationId: previous.delivery.authorizationId,
     authorizationId: randomUUID(),
     ...next,
+    targetBranch: next.targetBranch!,
     ...(authorizedRemoteUrl ? { authorizedRemoteUrl } : {}),
   };
-  const directory = path.join(root, '.comet', 'runtime', 'classic-delivery');
+  const directory = path.join(resolveWorkspaceRuntimeRootSync(root), 'classic-delivery');
   await ensureClassicProjectDirectory(
     root,
     directory,

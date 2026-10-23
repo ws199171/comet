@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import {
+  assertChangeNotSdkOwned,
+  COMET_CHANGE_OWNER_SCHEMA,
+  registerCompatChangeOwner,
+} from '../workflow-contract/change-runtime-owner.js';
 import { Lexer } from 'marked';
 import { atomicWriteText } from './native-atomic-file.js';
 import {
@@ -90,10 +95,35 @@ export const NATIVE_PORTABLE_BRIEF_TEMPLATE = nativeBriefTemplate('en', { compac
 
 const NATIVE_CAPABILITY_ASSOCIATION_FILE = 'capability-association.yaml';
 
+const SHAPE_MARKDOWN_FIELDS = new Set([
+  'type',
+  'text',
+  'tokens',
+  'depth',
+  'ordered',
+  'start',
+  'loose',
+  'items',
+  'task',
+  'checked',
+  'href',
+  'title',
+  'tag',
+  'lang',
+  'codeBlockStyle',
+  'escaped',
+  'pre',
+  'block',
+  'inLink',
+  'inRawBlock',
+  'align',
+  'header',
+  'rows',
+]);
+
 function normalizedShapeArtifactText(text: string, markdown = false): string {
   if (markdown) {
-    // Bind Markdown structure and content, retaining code, HTML, lists and hard
-    // breaks. Lexer transport spelling and block spacing carry no semantics.
+    // 只绑定结构和内容；解析器新增的 autolink 等元数据不改变既有确认身份。
     const normalize = (value: unknown): unknown => {
       if (Array.isArray(value)) {
         return value.filter((entry) => entry?.type !== 'space').map(normalize);
@@ -102,7 +132,10 @@ function normalizedShapeArtifactText(text: string, markdown = false): string {
         const token = value as Record<string, unknown>;
         return Object.fromEntries(
           Object.entries(token)
-            .filter(([key]) => key !== 'raw' && !(key === 'text' && Array.isArray(token.tokens)))
+            .filter(
+              ([key]) =>
+                SHAPE_MARKDOWN_FIELDS.has(key) && !(key === 'text' && Array.isArray(token.tokens)),
+            )
             .map(([key, entry]) => [
               key,
               key === 'text' && token.type === 'text' && typeof entry === 'string'
@@ -182,11 +215,15 @@ export async function validateNativePortableDocuments(options: {
   specChanges?: readonly NativePortableSpecChange[];
 }): Promise<NativeArtifactValidation> {
   const changeDir = nativePortableChangeDir(options.paths, options.state.name);
+  const constraintsVersion = options.state.document_constraints_version;
+  const compactConstraints = constraintsVersion === 2 || constraintsVersion === 3;
+  const structureConstraints = constraintsVersion === 3;
   const findings: NativeFinding[] = [
     ...(
       await validateNativeBrief(changeDir, options.state.brief, {
         strict: true,
-        compact: options.state.document_constraints_version === 2,
+        compact: compactConstraints,
+        structure: structureConstraints,
       })
     ).findings,
   ];
@@ -291,6 +328,7 @@ export type NativePortableExpectedContinuationAction =
   | 'revise-implementation'
   | 'revise-requirements'
   | 'retry-verifier'
+  | 'continue-builder'
   | 'resolve-verifier-blocker'
   | 'disassociate-capability';
 
@@ -333,6 +371,7 @@ export async function createNativePortableChange(options: {
     async () => {
       if (!NAME_PATTERN.test(options.name))
         throw new Error(`Invalid Native change name: ${options.name}`);
+      await assertChangeNotSdkOwned(options.paths.projectRoot, 'native', options.name);
       if (
         options.initialProjectConfig &&
         (await readProjectConfig(options.paths.projectRoot)) === null
@@ -392,6 +431,12 @@ export async function createNativePortableChange(options: {
           }),
           { containedRoot: options.paths.runtimeDir },
         );
+        await registerCompatChangeOwner(options.paths.projectRoot, {
+          schema: COMET_CHANGE_OWNER_SCHEMA,
+          workflow: 'native',
+          change: options.name,
+          format: 'compat',
+        });
         return state;
       } catch (error) {
         if (createdRuntime) await fs.rm(runtimeDir, { recursive: true, force: true });
@@ -768,7 +813,11 @@ export async function readNativePortableAcceptance(options: {
       ...spec,
       contentHash: canonicalHash(
         'comet.native.shape-artifact-content.v1',
-        normalizedShapeArtifactText(source.text, options.state.document_constraints_version === 2),
+        normalizedShapeArtifactText(
+          source.text,
+          options.state.document_constraints_version !== undefined &&
+            options.state.document_constraints_version !== 1,
+        ),
       ),
       ...(deltaContentHash === null ? {} : { deltaContentHash }),
     });
@@ -816,14 +865,20 @@ export async function readNativePortableAcceptance(options: {
     acceptance: buildNativePortableAcceptance({
       briefMarkdown: brief.text,
       specs,
-      resolveBriefReferences: options.state.document_constraints_version === 2,
+      resolveBriefReferences:
+        options.state.document_constraints_version !== undefined &&
+        options.state.document_constraints_version !== 1,
     }),
     formalHash: canonicalHash('comet.native.shape-formal-artifacts.v1', {
       brief: {
         source: brief.ref,
         contentHash: canonicalHash(
           'comet.native.shape-artifact-content.v1',
-          normalizedShapeArtifactText(brief.text, options.state.document_constraints_version === 2),
+          normalizedShapeArtifactText(
+            brief.text,
+            options.state.document_constraints_version !== undefined &&
+              options.state.document_constraints_version !== 1,
+          ),
         ),
       },
       specs: specArtifacts,
@@ -869,7 +924,7 @@ export async function prepareNativePortableShapeConfirmation(options: {
       }
       const shapeBoundary =
         options.enforceDocumentConstraints === true
-          ? { ...state, document_constraints_version: 2 as const }
+          ? { ...state, document_constraints_version: 3 as const }
           : state;
       const specChanges = await discoverNativePortableSpecChanges({ paths: options.paths, state });
       if (options.enforceDocumentConstraints === true) {

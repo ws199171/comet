@@ -1,7 +1,9 @@
 export * from './types.js';
 export * from './records.js';
 export * from './project-memory.js';
+export * from './project-learning.js';
 export * from './query.js';
+export * from './retrieval.js';
 export * from './corpus.js';
 export * from './local-provider.js';
 export * from './index-store.js';
@@ -13,5 +15,6 @@ export * from './plugin.js';
 export * from './deterministic-extractors.js';
 export * from './readiness.js';
 export * from './learning.js';
+export * from './host-review.js';
 export * from './capability-discovery.js';
 export * from './provider-factory.js';

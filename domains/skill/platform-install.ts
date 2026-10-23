@@ -1,4 +1,8 @@
 import path from 'path';
+import {
+  buildNodeHookCommand,
+  readNodeHookArguments,
+} from '../../platform/process/hook-command.js';
 import { existsSync } from 'fs';
 import { readFile, writeFile, lstat, unlink, symlink, rm, readdir, realpath } from 'fs/promises';
 import { fileURLToPath } from 'url';
@@ -22,11 +26,7 @@ import {
   checkpointClassicLayoutInitialization,
   type ClassicLayoutInitializationPermit,
 } from '../comet-classic/classic-layout-initialization.js';
-import {
-  mergeDshInstruction,
-  reconcileDshCordisPatch,
-  removeDshCordisPatch,
-} from './dsh-adapter.js';
+import { mergeDshInstruction, reconcileDshCordisPatch } from './dsh-adapter.js';
 import {
   parseWorkflowProjectConfigDocument,
   projectConfigComment,
@@ -69,6 +69,7 @@ const NATIVE_SHARED_SKILL_PATHS = new Set([
   'comet-review/agents/openai.yaml',
   'comet/scripts/comet-entry-runtime.mjs',
   'comet/scripts/comet-hook-router.mjs',
+  'comet/scripts/comet-hook-router-guard.mjs',
 ]);
 const RETIRED_COMET_OWNED_SKILL_PATHS = [
   'comet-native/scripts/comet-native-checkpoint.mjs',
@@ -233,6 +234,7 @@ export function isManagedSkillPathForSelection(
   if (workflowSelection === 'classic') return !skillPath.startsWith('comet-native/');
   return (
     NATIVE_SHARED_SKILL_PATHS.has(skillPath) ||
+    skillPath.startsWith('comet/reference/') ||
     skillPath.startsWith('comet-native/') ||
     skillPath.startsWith('comet-any/') ||
     skillPath.startsWith('comet-memory/')
@@ -694,6 +696,7 @@ async function prepareNativeSkillInstallTarget(
         relativePath === 'comet/SKILL.md' ||
         relativePath === 'comet/scripts/comet-entry-runtime.mjs' ||
         relativePath === 'comet/scripts/comet-hook-router.mjs' ||
+        relativePath === 'comet/scripts/comet-hook-router-guard.mjs' ||
         relativePath.startsWith('comet-any/') ||
         relativePath.startsWith('comet-native/'),
     )
@@ -1445,7 +1448,7 @@ async function installCometHooksForPlatform(
         return result;
       }
       case 'dsh': {
-        await reconcileDshCordisPatch(baseDir, platform, scope);
+        const rollback = await reconcileDshCordisPatch(baseDir, platform, scope);
         try {
           const result = await installClaudeCodeHooks(
             baseDir,
@@ -1454,21 +1457,21 @@ async function installCometHooksForPlatform(
             hooksConfig,
             platform.hookConfigFile ?? 'hooks.json',
             platform.name,
-            { platformId: platform.id, scope },
+            { platformId: platform.id, scope, hookMatcher: platform.hookMatcher },
           );
           if (result.status !== 'installed') {
-            await removeDshCordisPatch(baseDir, platform, scope);
+            await rollback();
             return result;
           }
           return {
             status: 'installed',
             reason:
               scope === 'project'
-                ? 'dsh Hook config installed; load the official bridge in a profile and run `dsh ... --patch .dsh/cordis.patch.yml` to activate it'
-                : 'dsh Hook config installed; load the official bridge in the active profile to activate it',
+                ? 'dsh Hook config installed; restart dsh with `--patch .dsh/cordis.patch.yml` to activate it'
+                : 'dsh Hook config installed in existing profiles (or the home patch before profiles exist); restart DSH to activate it and update again after adding a profile',
           };
         } catch (error) {
-          await removeDshCordisPatch(baseDir, platform, scope);
+          await rollback();
           throw error;
         }
       }
@@ -1578,10 +1581,6 @@ async function installCometHooksForPlatform(
   }
 }
 
-function quoteCommandArg(value: string): string {
-  return `"${value.replaceAll('\\', '/').replaceAll('"', '\\"')}"`;
-}
-
 /** Build a hook command that is stable even when the hook runner executes from a subdirectory. */
 function buildHookInvocation(
   baseDir: string,
@@ -1610,17 +1609,7 @@ function buildHookCommand(
   scriptRelPath: string,
   context?: HookCommandContext,
 ): string {
-  const projectRoot = path.resolve(baseDir);
-  const scriptPath = path.join(projectRoot, skillsDir, 'skills', ...scriptRelPath.split('/'));
-  let command = `node ${quoteCommandArg(scriptPath)}`;
-  if (scriptRelPath === HOOK_ROUTER_SCRIPT && context) {
-    command += ` --platform ${quoteCommandArg(context.platformId)}`;
-    if (context.scope === 'project') {
-      command += ` --project-root ${quoteCommandArg(projectRoot)}`;
-    }
-    return command;
-  }
-  return `${command} --project-root ${quoteCommandArg(projectRoot)}`;
+  return buildNodeHookCommand(buildHookInvocation(baseDir, skillsDir, scriptRelPath, context).args);
 }
 
 function parseCommandTokens(command: string): string[] | undefined {
@@ -1692,6 +1681,10 @@ function isManagedHookCommand(command: unknown, scriptRelPaths: string[], args?:
       matchesManagedScript(scriptPath)
     );
   }
+
+  const encodedArgs = readNodeHookArguments(command);
+  if (encodedArgs)
+    return typeof encodedArgs[0] === 'string' && matchesManagedScript(encodedArgs[0]);
 
   // Match both the current `node .../comet-hook-guard.mjs` form and the legacy
   // `bash .../comet-hook-guard.sh` form so uninstall also cleans up hooks

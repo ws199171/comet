@@ -1,4 +1,10 @@
 import { createHash } from 'node:crypto';
+import {
+  operationSignal,
+  OperationBudgetError,
+  throwIfOperationAborted,
+  withoutOperationBudget,
+} from '../../platform/process/operation-budget.js';
 
 import type {
   AgentContextOutcomeStatus,
@@ -6,7 +12,11 @@ import type {
   AgentLearningDelta,
 } from './types.js';
 import { AGENT_EXPERIENCE_SCHEMA } from './types.js';
-import type { AgentExperienceCaptureResult } from './experience-journal.js';
+import type {
+  AgentExperienceCaptureResult,
+  AgentLearningStatus,
+  AgentLearningWait,
+} from './experience-journal.js';
 import { AgentExperienceJournal } from './experience-journal.js';
 
 export interface AgentReflectionRequest {
@@ -28,6 +38,13 @@ export interface AgentReflectionResult {
   readonly deltas: readonly AgentLearningDelta[];
   /** Deterministic deltas may be consolidated while semantic work remains replayable. */
   readonly deferred: boolean;
+  readonly waitFor?: readonly AgentLearningWait[];
+}
+
+class AgentReflectionWaiting extends Error {
+  public constructor(readonly waitFor: readonly AgentLearningWait[]) {
+    super('Agent Reflection awaits host review');
+  }
 }
 
 export type AgentReflectionOutput = readonly AgentLearningDelta[] | AgentReflectionResult;
@@ -53,6 +70,7 @@ export interface AgentLearningCoordinatorOptions {
   readonly schedule?: (task: () => Promise<void>) => void | Promise<void>;
   readonly maxEventsPerReflection?: number;
   readonly maxEvidencePerReflection?: number;
+  readonly isWaitingResolved?: (wait: AgentLearningWait) => Promise<boolean>;
   readonly onDiagnostic?: (message: string) => void;
 }
 
@@ -67,6 +85,7 @@ export class AgentLearningCoordinator {
   private readonly schedule: (task: () => Promise<void>) => void | Promise<void>;
   private readonly maxEvents: number;
   private readonly maxEvidence: number;
+  private readonly isWaitingResolved?: (wait: AgentLearningWait) => Promise<boolean>;
   private readonly onDiagnostic?: (message: string) => void;
   private readonly episodeQueues = new Map<string, Promise<readonly AgentLearningDelta[]>>();
   private readonly scheduledEventIds = new Set<string>();
@@ -77,6 +96,7 @@ export class AgentLearningCoordinator {
     this.schedule = options.schedule ?? ((task) => void task());
     this.maxEvents = positive(options.maxEventsPerReflection, 8);
     this.maxEvidence = positive(options.maxEvidencePerReflection, 16);
+    this.isWaitingResolved = options.isWaitingResolved;
     this.onDiagnostic = options.onDiagnostic;
   }
 
@@ -115,13 +135,18 @@ export class AgentLearningCoordinator {
     return { ...captured, reflectedSynchronously: synchronous, deltas };
   }
 
-  public async replayPending(limit = 50): Promise<void> {
+  public async replayPending(
+    limit = 50,
+    options: { readonly waitForCompletion?: boolean } = {},
+  ): Promise<void> {
     const pending = await this.journal.pending(limit);
     for (const event of pending) {
+      if (operationSignal()?.aborted) return;
+      throwIfOperationAborted();
       if (this.scheduledEventIds.has(event.eventId)) continue;
       this.scheduledEventIds.add(event.eventId);
       try {
-        await this.schedule(async () => {
+        const work = async () => {
           try {
             await this.processAndRecord(event);
           } catch (error) {
@@ -129,12 +154,47 @@ export class AgentLearningCoordinator {
           } finally {
             this.scheduledEventIds.delete(event.eventId);
           }
-        });
+        };
+        if (options.waitForCompletion) await work();
+        else await this.schedule(work);
       } catch (error) {
         this.scheduledEventIds.delete(event.eventId);
         this.onDiagnostic?.(`Agent Reflection replay scheduling failed: ${errorMessage(error)}`);
       }
     }
+  }
+
+  public status(): Promise<AgentLearningStatus> {
+    return this.journal.status();
+  }
+
+  public async retryFailed(): Promise<number> {
+    const count = await this.journal.retryFailed();
+    await this.replayPending();
+    return count;
+  }
+
+  public async replayNow(options: { readonly waitForCompletion?: boolean } = {}): Promise<void> {
+    await this.journal.retryPendingNow();
+    await this.replayPending(50, options);
+  }
+
+  public async resumeReview(
+    review: AgentLearningWait,
+    matchesLegacy?: (event: AgentExperienceEvent) => Promise<boolean>,
+  ): Promise<number> {
+    const ready = [...(await this.journal.releaseWaiting(review))];
+    if (matchesLegacy) {
+      const legacyIds: string[] = [];
+      for (const event of await this.journal.legacyReviewCandidates()) {
+        if (await matchesLegacy(event)) legacyIds.push(event.eventId);
+      }
+      ready.push(...(await this.journal.releaseLegacyReview(legacyIds)));
+    }
+    for (const event of ready) {
+      await this.processAndRecord(event);
+    }
+    return ready.length;
   }
 
   public async feedback(options: {
@@ -200,8 +260,10 @@ export class AgentLearningCoordinator {
     }
 
     const failures: string[] = [];
+    const waiting: AgentLearningWait[] = [];
     const deltas: AgentLearningDelta[] = [];
     for (const { learner, events: learnerEvents } of byOwner.values()) {
+      throwIfOperationAborted();
       try {
         const requests = chunkReflectionRequests(
           episodeId,
@@ -211,10 +273,14 @@ export class AgentLearningCoordinator {
         );
         const reflectedDeltas: AgentLearningDelta[] = [];
         let reflectionDeferred = false;
+        const ownerWaiting: AgentLearningWait[] = [];
         for (const request of requests) {
+          throwIfOperationAborted();
           await this.journal.renewClaim(claim);
           const reflected = normalizeReflectionResult(await learner.reflect(request));
+          throwIfOperationAborted();
           reflectionDeferred ||= reflected.deferred;
+          ownerWaiting.push(...(reflected.waitFor ?? []));
           for (const delta of reflected.deltas) {
             if (delta.owner !== learner.owner) {
               throw new Error(`${learner.owner} returned a Learning Delta owned by ${delta.owner}`);
@@ -230,11 +296,16 @@ export class AgentLearningCoordinator {
           reflectedDeltas,
         );
         if (consolidationDeltas.length > 0) {
+          throwIfOperationAborted();
           await this.journal.renewClaim(claim);
           await learner.consolidate({ episodeId, eventIds, deltas: consolidationDeltas });
           deltas.push(...consolidationDeltas.map((entry) => entry.delta));
         }
         if (reflectionDeferred) {
+          if (ownerWaiting.length > 0) {
+            waiting.push(...ownerWaiting);
+            continue;
+          }
           throw new Error(`${learner.owner} semantic Reflection deferred`);
         }
         await this.journal.markLearnerCompleted(
@@ -243,35 +314,70 @@ export class AgentLearningCoordinator {
           learnerEvents.map((entry) => entry.eventId),
         );
       } catch (error) {
+        if (error instanceof OperationBudgetError || operationSignal()?.aborted) throw error;
         const message = `${learner.owner} reflection failed: ${errorMessage(error)}`;
         failures.push(message);
         this.onDiagnostic?.(message);
       }
     }
     if (failures.length > 0) throw new Error(failures.join('; '));
+    if (waiting.length > 0) throw new AgentReflectionWaiting(waiting);
     return deltas;
   }
 
   private async processAndRecord(
     event: AgentExperienceEvent,
   ): Promise<readonly AgentLearningDelta[]> {
-    const previous = this.episodeQueues.get(event.episodeId) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const deltas: AgentLearningDelta[] = [];
-        while (true) {
-          const claim = await this.journal.claimEpisode(event.episodeId);
-          if (claim === null) return deltas;
-          try {
-            deltas.push(...(await this.processEpisode(claim)));
-            await this.journal.completeClaim(claim);
-          } catch (error) {
-            await this.journal.failClaim(claim, errorMessage(error));
+    while (this.episodeQueues.has(event.episodeId)) {
+      throwIfOperationAborted();
+      const previous = this.episodeQueues.get(event.episodeId)!;
+      const signal = operationSignal();
+      // 只取消当前排队等待；已有反思继续由原调用管理。
+      await new Promise<void>((resolve, reject) => {
+        const aborted = () => {
+          signal?.removeEventListener('abort', aborted);
+          reject(new OperationBudgetError());
+        };
+        const settled = () => {
+          signal?.removeEventListener('abort', aborted);
+          resolve();
+        };
+        signal?.addEventListener('abort', aborted, { once: true });
+        previous.then(settled, settled);
+      });
+    }
+    throwIfOperationAborted();
+    const operation = Promise.resolve().then(async () => {
+      const deltas: AgentLearningDelta[] = [];
+      while (true) {
+        throwIfOperationAborted();
+        const claim = await this.journal.claimEpisode(event.episodeId, { maxEvents: 64 });
+        if (claim === null) return deltas;
+        try {
+          deltas.push(...(await this.processEpisode(claim)));
+          await this.journal.completeClaim(claim);
+        } catch (error) {
+          if (error instanceof OperationBudgetError || operationSignal()?.aborted) {
+            await withoutOperationBudget(() => this.journal.releaseClaim(claim));
             throw error;
           }
+          if (error instanceof AgentReflectionWaiting) {
+            await this.journal.waitClaim(claim, error.waitFor);
+            let released = false;
+            for (const wait of error.waitFor) {
+              if (await this.isWaitingResolved?.(wait)) {
+                const ready = await this.journal.releaseWaiting(wait);
+                released = released || ready.length > 0;
+              }
+            }
+            if (released) continue;
+            return deltas;
+          }
+          await this.journal.failClaim(claim, errorMessage(error));
+          throw error;
         }
-      });
+      }
+    });
     this.episodeQueues.set(event.episodeId, operation);
     try {
       return await operation;

@@ -1,3 +1,4 @@
+import { observeRuntimeChildSpan } from '../../platform/process/runtime-trace.js';
 import {
   AgentExperienceJournal,
   AgentLearningCoordinator,
@@ -5,7 +6,10 @@ import {
   validateAgentContextCandidate,
   validateAgentExperienceEvent,
   type AgentContextCandidate,
+  type ContextQuerySample,
   type AgentExperienceEvent,
+  type AgentLearningStatus,
+  type AgentLearningWait,
 } from '../agent-learning/index.js';
 import type {
   PluginContextRequest,
@@ -125,6 +129,7 @@ export interface PluginRuntimeOptions {
     readonly project: AgentExperienceJournal;
   };
   readonly scheduleLearning?: (task: () => Promise<void>) => void | Promise<void>;
+  readonly isLearningWaitResolved?: (wait: AgentLearningWait) => Promise<boolean>;
   /** Skip durable reflection replay while collecting optional Hook context. */
   readonly replayPendingLearningOnContext?: boolean;
   readonly now?: () => Date;
@@ -147,6 +152,7 @@ export class PluginRuntime {
   private readonly replayPendingLearningOnContext: boolean;
   private readonly learningByScope: Readonly<Record<'user' | 'project', AgentLearningCoordinator>>;
   private readonly learningCoordinators: readonly AgentLearningCoordinator[];
+  private readonly journalsByScope: Readonly<Record<'user' | 'project', AgentExperienceJournal>>;
   private readonly active = new Map<string, ActivePlugin>();
   private readonly diagnosticEntries: PluginDiagnostic[] = [];
 
@@ -166,11 +172,12 @@ export class PluginRuntime {
     );
     this.descriptors = descriptors;
     this.now = options.now ?? (() => new Date());
-    this.replayPendingLearningOnContext = options.replayPendingLearningOnContext ?? true;
+    this.replayPendingLearningOnContext = options.replayPendingLearningOnContext ?? false;
     const fallbackJournal =
       options.journal ?? new AgentExperienceJournal(new MemoryAgentExperienceJournalStore());
     const userJournal = options.journals?.user ?? fallbackJournal;
     const projectJournal = options.journals?.project ?? fallbackJournal;
+    this.journalsByScope = { user: userJournal, project: projectJournal };
     const coordinatorFor = (journal: AgentExperienceJournal) =>
       new AgentLearningCoordinator({
         journal,
@@ -178,6 +185,7 @@ export class PluginRuntime {
         // Capture is durable before scheduling. Hosts may provide a scheduler, while
         // short-lived CLI processes return immediately and replay unfinished work later.
         schedule: options.scheduleLearning ?? ((task) => void task()),
+        isWaitingResolved: options.isLearningWaitResolved,
         onDiagnostic: (message) => {
           const pluginId = message.split(' reflection', 1)[0] || 'comet.agent-learning';
           this.recordExecutionFailure(pluginId, 'event', new Error(message));
@@ -360,13 +368,85 @@ export class PluginRuntime {
       });
       throw error;
     }
-    await this.replayPendingLearning();
     await this.learningByScope[event.scope].capture(event);
   }
 
+  /** Capture durable events without invoking Providers on the context delivery path. */
+  public async enqueueEvents(
+    values: readonly AgentExperienceEvent[],
+    options: { readonly finalizeUnobserved?: boolean } = {},
+  ): Promise<void> {
+    const events = values.map(validateAgentExperienceEvent);
+    const state = options.finalizeUnobserved ? await this.store.read() : undefined;
+    const processedEventIds =
+      state === undefined
+        ? []
+        : events
+            .filter((event) => {
+              // Only already-loaded modules can establish that an event has no subscribers.
+              // Failed or not-yet-loaded modules leave the event pending for a later retry.
+              return state.plugins.every((record) => {
+                if (
+                  record.status !== 'enabled' ||
+                  (event.projectId !== undefined &&
+                    record.disabledProjects.includes(event.projectId))
+                )
+                  return true;
+                const descriptor = this.descriptors.get(record.id);
+                if (!descriptor) return false;
+                if (!descriptor.scopes.includes(event.scope)) return true;
+                const active = this.active.get(
+                  this.activeKey(record.id, { scope: event.scope, projectId: event.projectId }),
+                );
+                if (!active) return false;
+                return (
+                  (active.module.reflect === undefined && active.module.onEvent === undefined) ||
+                  (active.module.events !== undefined && !active.module.events.includes(event.type))
+                );
+              });
+            })
+            .map((event) => event.eventId);
+    for (const scope of ['user', 'project'] as const)
+      await this.journalsByScope[scope].captureMany(
+        events.filter((event) => event.scope === scope),
+        { processedEventIds },
+      );
+  }
+
+  public async resumeReview(
+    review: AgentLearningWait,
+    matchesLegacy?: (event: AgentExperienceEvent) => Promise<boolean>,
+  ): Promise<number> {
+    return this.learningByScope.project.resumeReview(review, matchesLegacy);
+  }
+
+  public async learningStatus(scope: 'project' | 'all' = 'project'): Promise<AgentLearningStatus> {
+    if (scope === 'project') return this.learningByScope.project.status();
+    const statuses = await Promise.all(
+      this.learningCoordinators.map((coordinator) => coordinator.status()),
+    );
+    return statuses.reduce(
+      (total, status) => ({
+        pending: total.pending + status.pending,
+        processing: (total.processing ?? 0) + (status.processing ?? 0),
+        retryScheduled: total.retryScheduled + status.retryScheduled,
+        waiting: total.waiting + status.waiting,
+        failed: total.failed + status.failed,
+      }),
+      { pending: 0, processing: 0, retryScheduled: 0, waiting: 0, failed: 0 },
+    );
+  }
+
+  public retryFailedLearning(): Promise<number> {
+    return this.learningByScope.project.retryFailed();
+  }
+
   /** Replay durable learning observations captured by an earlier process. */
-  public async replayLearning(): Promise<void> {
-    await this.replayPendingLearning();
+  public async replayLearning(options: { readonly retryNow?: boolean } = {}): Promise<void> {
+    for (const coordinator of this.learningCoordinators) {
+      if (options.retryNow) await coordinator.replayNow({ waitForCompletion: true });
+      else await coordinator.replayPending(50, { waitForCompletion: true });
+    }
   }
 
   private async learningAdapters(event: AgentExperienceEvent) {
@@ -410,10 +490,28 @@ export class PluginRuntime {
   public async collectContext(
     request: PluginContextRequest,
     scope: PluginScopeTarget,
+    onQuery?: (sample: ContextQuerySample) => void,
   ): Promise<AgentContextCandidate[]> {
     if (this.replayPendingLearningOnContext) await this.replayPendingLearning();
     const target = normalizeScopeTarget(scope);
+    const notify = (sample: ContextQuerySample) => {
+      try {
+        onQuery?.(sample);
+      } catch {
+        /* Observability cannot interrupt context delivery. */
+      }
+    };
+    const diagnosticOffset = this.diagnosticEntries.length;
+    const loadStarted = performance.now();
     await this.loadScope(target);
+    for (const diagnostic of this.diagnosticEntries.slice(diagnosticOffset)) {
+      if (diagnostic.phase === 'load')
+        notify({
+          owner: diagnostic.pluginId,
+          elapsedMs: performance.now() - loadStarted,
+          status: 'error',
+        });
+    }
     const candidates: AgentContextCandidate[] = [];
     for (const active of this.active.values()) {
       if (
@@ -422,8 +520,21 @@ export class PluginRuntime {
         active.module.provideContext === undefined
       )
         continue;
+      const started = performance.now();
+      let limited = false;
+      let returned = 0;
       try {
-        const contribution = await active.module.provideContext({ ...request });
+        const contribution = await observeRuntimeChildSpan(
+          active.descriptor.id,
+          async () =>
+            active.module.provideContext!({
+              ...request,
+              reportRetrievalIssue: () => {
+                limited = true;
+              },
+            }),
+          () => (limited ? 'unknown' : 'succeeded'),
+        );
         if (contribution === null) continue;
         for (const value of Array.isArray(contribution) ? contribution : [contribution]) {
           candidates.push(
@@ -432,9 +543,17 @@ export class PluginRuntime {
               owner: active.descriptor.id,
             }),
           );
+          returned++;
         }
       } catch (error) {
+        limited = true;
         this.recordExecutionFailure(active.descriptor.id, 'context', error);
+      } finally {
+        notify({
+          owner: active.descriptor.id,
+          elapsedMs: performance.now() - started,
+          status: limited ? (returned ? 'partial' : 'error') : 'ok',
+        });
       }
     }
     return candidates;
